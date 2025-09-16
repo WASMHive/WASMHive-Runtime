@@ -1,0 +1,10 @@
+[package]
+name = "distributed_examples"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+distribute_macro = { path = "../distribute_macro" }
+distribute_runtime = { path = "../distribute_runtime" }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }
