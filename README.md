@@ -21,16 +21,6 @@ A high-performance distributed computing system built with WASM and WebRTC that 
 
 ## 🚀 Quick Start
 
-### 1. Start the Signaling Server
-
-```bash
-cd /path/to/project/network/server
-npm install  # Install WebSocket dependencies (ws library)
-node websocket-server.js
-```
-
-### 3. Run Distributed Computation
-
 ```bash
 cd examples
 cargo run
