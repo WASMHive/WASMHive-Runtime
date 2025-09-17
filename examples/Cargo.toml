@@ -3,8 +3,40 @@ name = "distributed_examples"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
-distribute_macro = { path = "../distribute_macro" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+log = "0.4"
+console_log = "1.0"
+futures = "0.3"
+getrandom = { version = "0.2", features = ["js"] }
+
+# Only include these for native builds, not WASM
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 distribute_runtime = { path = "../distribute_runtime" }
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.0", features = ["full"] }
+wgpu = "22.0"
+bytemuck = "1.0"
+
+[dependencies.web-sys]
+version = "0.3.79"
+features = [
+  "console",
+  "GpuAdapter",
+  "GpuBuffer",
+  "GpuCommandEncoder",
+  "GpuComputePassDescriptor",
+  "GpuComputePipeline",
+  "GpuBindGroup",
+  "GpuShaderModule",
+  "GpuQueue",
+  "GpuBufferDescriptor",
+  "GpuBindGroupDescriptor",
+  "GpuBindGroupLayoutDescriptor",
+  "GpuPipelineLayoutDescriptor",
+  "GpuComputePipelineDescriptor",
+]

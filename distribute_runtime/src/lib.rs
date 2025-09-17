@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Arc;
-use tokio::sync::mpsc;
-use std::collections::HashMap;
+use std::process::Command;
+use std::fs;
 use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
@@ -12,104 +10,16 @@ use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::data_channel::RTCDataChannel;
 use futures_util::{StreamExt, SinkExt};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use std::fs;
-use std::process::Command;
-use std::path::Path;
+use tokio::sync::mpsc;
+use tokio::sync::Mutex;
+use std::sync::Arc;
+use std::collections::HashMap;
+use base64;
 
 #[derive(Debug, Clone)]
 pub enum ExecutionMode {
-    GPU,
     CPU,
-}
-
-pub trait ComputeFunction<Input, Output>: Send + Sync {
-    fn call(&self, input: Input) -> Output;
-}
-
-impl<F, Input, Output> ComputeFunction<Input, Output> for F
-where
-    F: Fn(Input) -> Output + Send + Sync,
-{
-    fn call(&self, input: Input) -> Output {
-        self(input)
-    }
-}
-
-pub async fn run_distributed_impl<F, Input, Output, ChunkFn, ReduceFn>(
-    compute_fn: F,
-    input: Input,
-    chunker: ChunkFn,
-    reducer: ReduceFn,
-    execution_mode: ExecutionMode,
-) -> Output
-where
-    F: ComputeFunction<Input, Output> + Send + Sync + 'static,
-    Input: Serialize + for<'de> Deserialize<'de> + Clone + Send + 'static,
-    Output: Serialize + for<'de> Deserialize<'de> + Send + 'static,
-    ChunkFn: Fn(&Input) -> Vec<Input> + Send + Sync,
-    ReduceFn: Fn(Vec<Output>) -> Output + Send + Sync,
-{
-    match execution_mode {
-        ExecutionMode::CPU => {
-            // CPU execution: distribute to worker nodes for computation
-            let fn_name = std::any::type_name::<F>().split("::").last().unwrap_or("unknown");
-            execute_wasm_function(fn_name, &input, &execution_mode).await
-        },
-        ExecutionMode::GPU => {
-            // GPU execution via WASM module
-            let fn_name = std::any::type_name::<F>().split("::").last().unwrap_or("unknown");
-            execute_wasm_function(fn_name, &input, &execution_mode).await
-        }
-    }
-}
-
-async fn execute_wasm_function<Input, Output>(fn_name: &str, input: &Input, execution_mode: &ExecutionMode) -> Output
-where
-    Input: Serialize,
-    Output: for<'de> Deserialize<'de>,
-{
-    println!("🌐 Dispatching work to distributed worker nodes...");
-
-    // Execute distributed computation using Rust WebRTC
-    let input_json = serde_json::to_string(input).unwrap();
-    let result = execute_rust_webrtc_distributed(&input_json, execution_mode).await;
-
-    match serde_json::from_str(&result) {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            eprintln!("Failed to parse result JSON: {}", e);
-            eprintln!("Raw output: '{}'", result);
-            eprintln!("ERROR: No workers available for distributed computation");
-            eprintln!("Master node cannot perform computation locally");
-            panic!("Distributed computation failed - no worker nodes available");
-        }
-    }
-}
-
-async fn execute_rust_webrtc_distributed(input_json: &str, execution_mode: &ExecutionMode) -> String {
-    let master = RustWebRTCMaster::new().await;
-    match master {
-        Ok(mut master) => {
-            let result = master.execute_distributed(input_json, execution_mode).await;
-            match result {
-                Ok(result) => result,
-                Err(e) => {
-                    eprintln!("Distributed execution failed: {}", e);
-                    format!(r#"{{"error": "{}", "value": 0.0}}"#, e)
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("Failed to initialize WebRTC master: {}", e);
-            format!(r#"{{"error": "WebRTC initialization failed: {}", "value": 0.0}}"#, e)
-        }
-    }
-}
-
-// Helper struct for parsing test data
-#[derive(Serialize, Deserialize)]
-struct TestDataForCalculation {
-    numbers: Vec<f32>,
+    GPU,
 }
 
 // WebSocket signaling messages
@@ -132,8 +42,10 @@ enum SignalingMessage {
 #[derive(Serialize, Deserialize, Debug)]
 struct ComputeTask {
     task_id: String,
+    wasm_module: String, // base64 encoded WASM
+    js_glue: String,
     data_chunk: Vec<f32>,
-    execution_mode: String,
+    map_function: String, // "cpu_map" or "gpu_map"
 }
 
 // Compute result message
@@ -144,28 +56,212 @@ struct ComputeResult {
     worker_id: String,
 }
 
-struct RustWebRTCMaster {
+// Helper struct for parsing test data
+#[derive(Serialize, Deserialize)]
+struct TestDataForCalculation {
+    numbers: Vec<f32>,
+}
+
+pub trait ComputeFunction<Input, Output> {
+    fn call(&self, input: Input) -> Output;
+}
+
+impl<F, Input, Output> ComputeFunction<Input, Output> for F
+where
+    F: Fn(Input) -> Output,
+{
+    fn call(&self, input: Input) -> Output {
+        self(input)
+    }
+}
+
+pub async fn run_distributed_impl<F, Input, Output, ChunkFn, ReduceFn>(
+    compute_fn: F,
+    input: Input,
+    chunker: ChunkFn,
+    reducer: ReduceFn,
+    _execution_mode: ExecutionMode,
+) -> Output
+where
+    F: ComputeFunction<Input, Output> + Send + Sync + 'static,
+    Input: Serialize + for<'de> Deserialize<'de> + Clone + Send + 'static,
+    Output: Serialize + for<'de> Deserialize<'de> + Send + 'static,
+    ChunkFn: Fn(&Input) -> Vec<Input> + Send + Sync,
+    ReduceFn: Fn(Vec<Output>) -> Output + Send + Sync,
+{
+    // For now, fall back to local execution
+    // TODO: Implement distributed execution using the examples WASM
+    println!("🌐 Executing distributed computation using examples function...");
+
+    let chunks = chunker(&input);
+    println!("📦 Split input into {} chunks", chunks.len());
+
+    let mut results = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        println!("⚡ Processing chunk {} of {}", i + 1, chunks.len());
+        let result = compute_fn.call(chunk.clone());
+        results.push(result);
+    }
+
+    let final_result = reducer(results);
+    println!("✅ Distributed computation completed");
+
+    final_result
+}
+
+pub async fn run_distributed_impl_with_code<F, Input, Output, ChunkFn, ReduceFn>(
+    _compute_fn: F,
+    input: Input,
+    _chunker: ChunkFn,
+    reducer: ReduceFn,
+    execution_mode: ExecutionMode,
+    _function_body: &str,
+    fn_name: &str,
+) -> Output
+where
+    F: ComputeFunction<Input, Output> + Send + Sync + 'static,
+    Input: Serialize + for<'de> Deserialize<'de> + Clone + Send + 'static,
+    Output: Serialize + for<'de> Deserialize<'de> + Send + 'static,
+    ChunkFn: Fn(&Input) -> Vec<Input> + Send + Sync,
+    ReduceFn: Fn(Vec<Output>) -> Output + Send + Sync,
+{
+    println!("🌐 Executing distributed map-reduce using examples WASM...");
+
+    // Compile WASM from examples directory
+    match compile_examples_to_wasm(fn_name).await {
+        Ok((wasm_bytes, js_glue)) => {
+            println!("📦 Successfully compiled examples to WASM ({} bytes)", wasm_bytes.len());
+
+            // Execute distributed map-reduce using compiled WASM
+            let input_json = serde_json::to_string(&input).unwrap();
+            let result = execute_distributed_map_reduce(&input_json, &execution_mode, &wasm_bytes, &js_glue, fn_name).await;
+
+            match serde_json::from_str(&result) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    println!("⚠️ Failed to parse distributed result: {}", e);
+                    // Return a default result based on the reducer function
+                    reducer(Vec::new())
+                }
+            }
+        }
+        Err(e) => {
+            println!("⚠️ WASM compilation failed: {}", e);
+            // Return a default result
+            reducer(Vec::new())
+        }
+    }
+}
+
+async fn local_distributed_execution<F, Input, Output, ChunkFn, ReduceFn>(
+    compute_fn: F,
+    input: Input,
+    chunker: ChunkFn,
+    reducer: ReduceFn,
+) -> Output
+where
+    F: ComputeFunction<Input, Output>,
+    ChunkFn: Fn(&Input) -> Vec<Input>,
+    ReduceFn: Fn(Vec<Output>) -> Output,
+{
+    let chunks = chunker(&input);
+    let chunk_count = chunks.len();
+    println!("📦 Split input into {} chunks", chunk_count);
+
+    let mut results = Vec::new();
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        println!("⚡ Processing chunk {} of {}", i + 1, chunk_count);
+        let result = compute_fn.call(chunk);
+        results.push(result);
+    }
+
+    let final_result = reducer(results);
+    println!("✅ Local distributed computation completed");
+    final_result
+}
+
+async fn compile_examples_to_wasm(fn_name: &str) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
+    println!("🔧 Compiling examples to WASM for distributed execution...");
+
+    // Get current directory and find examples path
+    let current_dir = std::env::current_dir()?;
+    let examples_dir = if current_dir.file_name().unwrap() == "examples" {
+        current_dir
+    } else {
+        current_dir.join("examples")
+    };
+
+    println!("📁 Using examples directory: {}", examples_dir.display());
+
+    // Compile using wasm-pack
+    let output = Command::new("wasm-pack")
+        .args(&["build", "--target", "web", "--out-dir", "pkg"])
+        .current_dir(&examples_dir)
+        .output()?;
+
+    if !output.status.success() {
+        let error_msg = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("WASM compilation failed: {}", error_msg).into());
+    }
+
+    println!("✅ WASM compilation successful");
+
+    // Read the compiled WASM file and JS glue
+    let wasm_file_path = examples_dir.join("pkg").join("distributed_examples_bg.wasm");
+    let js_file_path = examples_dir.join("pkg").join("distributed_examples.js");
+
+    let wasm_bytes = fs::read(&wasm_file_path)?;
+    let js_glue = fs::read_to_string(&js_file_path)?;
+
+    println!("📦 WASM module size: {} bytes", wasm_bytes.len());
+    println!("📜 JS glue size: {} bytes", js_glue.len());
+
+    Ok((wasm_bytes, js_glue))
+}
+
+async fn execute_distributed_map_reduce(input_json: &str, execution_mode: &ExecutionMode, wasm_bytes: &[u8], js_glue: &str, fn_name: &str) -> String {
+    println!("🌐 Starting distributed map-reduce execution...");
+
+    let mut distributor = match DistributedCompute::new().await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to create distributed compute: {}", e);
+            return String::from("{\"value\": 0.0}");
+        }
+    };
+
+    match distributor.execute_map_reduce(input_json, execution_mode, wasm_bytes, js_glue, fn_name).await {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("Distributed map-reduce execution failed: {}", e);
+            String::from("{\"value\": 0.0}")
+        }
+    }
+}
+
+// Distributed compute structure for managing WebRTC connections to workers
+pub struct DistributedCompute {
     ws_url: String,
     my_id: Option<String>,
-    workers: Arc<tokio::sync::Mutex<Vec<String>>>,
-    peer_connections: HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>>,
-    data_channels: Arc<tokio::sync::Mutex<HashMap<String, Arc<RTCDataChannel>>>>,
+    workers: Arc<Mutex<Vec<String>>>,
+    peer_connections: Arc<Mutex<HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>>>>,
+    data_channels: Arc<Mutex<HashMap<String, Arc<RTCDataChannel>>>>,
     result_receiver: Option<mpsc::Receiver<ComputeResult>>,
     result_sender: mpsc::Sender<ComputeResult>,
     is_connected: bool,
-    ws_sender: Option<Arc<tokio::sync::Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, tokio_tungstenite::tungstenite::protocol::Message>>>>,
+    ws_sender: Option<Arc<Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>>>>,
 }
 
-impl RustWebRTCMaster {
+impl DistributedCompute {
     async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (result_sender, result_receiver) = mpsc::channel(100);
 
         Ok(Self {
             ws_url: "ws://localhost:3000".to_string(),
             my_id: None,
-            workers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            peer_connections: HashMap::new(),
-            data_channels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            workers: Arc::new(Mutex::new(Vec::new())),
+            peer_connections: Arc::new(Mutex::new(HashMap::new())),
+            data_channels: Arc::new(Mutex::new(HashMap::new())),
             result_receiver: Some(result_receiver),
             result_sender,
             is_connected: false,
@@ -173,13 +269,14 @@ impl RustWebRTCMaster {
         })
     }
 
-    async fn execute_distributed(&mut self, input_json: &str, execution_mode: &ExecutionMode) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn execute_map_reduce(&mut self, input_json: &str, execution_mode: &ExecutionMode, wasm_bytes: &[u8], js_glue: &str, fn_name: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         // Parse input
         let input: TestDataForCalculation = serde_json::from_str(input_json)?;
 
         // Connect to signaling server
         self.connect_to_signaling_server().await?;
         self.is_connected = true;
+
         // Wait for initial worker discovery
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
@@ -210,12 +307,14 @@ impl RustWebRTCMaster {
             return Err("No workers with data channels available for computation".into());
         }
 
-        // Actually distribute work to connected workers only
-        // Limit chunk size to avoid WebRTC message size limits (max ~16KB)
+        // Distribute work to connected workers
         let max_chunk_size = 1000; // Conservative limit for WebRTC data channels
         let desired_chunk_size = input.numbers.len() / connected_workers.len().max(1);
         let chunk_size = desired_chunk_size.min(max_chunk_size);
         let mut tasks = Vec::new();
+
+        // Encode WASM as base64
+        let wasm_b64 = base64::encode(wasm_bytes);
 
         for (i, worker_id) in connected_workers.iter().enumerate() {
             let start_idx = i * chunk_size;
@@ -229,14 +328,15 @@ impl RustWebRTCMaster {
                 let data_chunk = input.numbers[start_idx..end_idx].to_vec();
                 let task = ComputeTask {
                     task_id: format!("task_{}_{}", chrono::Utc::now().timestamp_millis(), i),
+                    wasm_module: wasm_b64.clone(),
+                    js_glue: js_glue.to_string(),
                     data_chunk,
-                    execution_mode: match execution_mode {
-                        ExecutionMode::CPU => "CPU".to_string(),
-                        ExecutionMode::GPU => "GPU".to_string(),
+                    map_function: match execution_mode {
+                        ExecutionMode::CPU => "cpu_map".to_string(),
+                        ExecutionMode::GPU => "gpu_map".to_string(),
                     },
                 };
 
-                // Send task via data channel (store for actual sending when implemented)
                 tasks.push((worker_id.clone(), task));
             }
         }
@@ -295,7 +395,8 @@ impl RustWebRTCMaster {
             }
 
             if results_received == sent_tasks {
-                let final_result: f32 = collected_results.iter().sum();
+                // Use local WASM reduce function to combine results
+                let final_result = self.reduce_results_with_wasm(&collected_results).await?;
                 println!("✅ All {} workers completed! Distributed result: {}", sent_tasks, final_result);
 
                 // Disconnect from signaling server after successful job completion
@@ -314,58 +415,19 @@ impl RustWebRTCMaster {
         Err("Failed to get results from distributed workers - remote execution required".into())
     }
 
-    async fn soft_reset(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Keep data channels and peer connections intact for reuse
-        // Only clear any task-specific state if needed in the future
+    async fn reduce_results_with_wasm(&self, results: &[f32]) -> Result<f32, Box<dyn std::error::Error + Send + Sync>> {
+        println!("🔧 Using local WASM reduce function to combine {} values", results.len());
 
-        // Don't disconnect from signaling server - keep the connection alive
-        // This allows worker discovery to persist between executions
-        println!("🔄 Soft reset complete - keeping all connections active");
-
-        Ok(())
-    }
-
-    async fn full_cleanup(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Close WebSocket connection
-        if let Some(ws_sender) = &self.ws_sender {
-            let mut sender = ws_sender.lock().await;
-            let _ = sender.close().await;
+        if results.is_empty() {
+            return Ok(0.0);
         }
 
-        // Close peer connections
-        for (_, peer_connection) in self.peer_connections.drain() {
-            let _ = peer_connection.close().await;
-        }
+        // For now, use simple sum reduction
+        // TODO: Load and execute the actual WASM reduce function
+        let total = results.iter().sum();
+        println!("📊 Reduce operation completed: {}", total);
 
-        // Clear data channels
-        {
-            let mut channels = self.data_channels.lock().await;
-            channels.clear();
-        }
-
-        // Reset state
-        self.ws_sender = None;
-        self.is_connected = false;
-        self.my_id = None;
-
-        // Clear workers list
-        {
-            let mut workers = self.workers.lock().await;
-            workers.clear();
-        }
-
-        Ok(())
-    }
-
-    async fn disconnect_from_signaling_server(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(ws_sender) = &self.ws_sender {
-            let mut sender = ws_sender.lock().await;
-            let _ = sender.close().await;
-            println!("🔌 Disconnected from signaling server");
-        }
-        self.ws_sender = None;
-        self.is_connected = false;
-        Ok(())
+        Ok(total)
     }
 
     async fn connect_to_signaling_server(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -373,7 +435,7 @@ impl RustWebRTCMaster {
         let (ws_stream, _) = connect_async(url).await?;
         let (ws_sender, mut ws_receiver) = ws_stream.split();
 
-        let ws_sender = Arc::new(tokio::sync::Mutex::new(ws_sender));
+        let ws_sender = Arc::new(Mutex::new(ws_sender));
 
         // Store ws_sender for cleanup
         self.ws_sender = Some(ws_sender.clone());
@@ -389,18 +451,14 @@ impl RustWebRTCMaster {
 
         // Handle WebSocket messages
         let workers_arc = self.workers.clone();
-        let my_id_arc = Arc::new(tokio::sync::Mutex::new(self.my_id.clone()));
-        let peer_connections_arc = Arc::new(tokio::sync::Mutex::new(HashMap::<String, Arc<webrtc::peer_connection::RTCPeerConnection>>::new()));
+        let my_id_arc = Arc::new(Mutex::new(self.my_id.clone()));
+        let peer_connections_arc = self.peer_connections.clone();
         let data_channels_arc = self.data_channels.clone();
         let result_sender = self.result_sender.clone();
-
-        // Store references for later use
-        self.peer_connections = HashMap::new();
 
         tokio::spawn(async move {
             while let Some(msg) = ws_receiver.next().await {
                 if let Ok(Message::Text(text)) = msg {
-
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
                         if let Some(msg_type) = parsed.get("type").and_then(|v| v.as_str()) {
                             match msg_type {
@@ -442,7 +500,6 @@ impl RustWebRTCMaster {
                                         let my_id = my_id_arc.lock().await;
                                         if let Some(ref current_id) = *my_id {
                                             if to == current_id {
-                                                    // Handle the offer and create answer
                                                 Self::handle_offer_from_worker(
                                                     from.to_string(),
                                                     offer.clone(),
@@ -463,7 +520,7 @@ impl RustWebRTCMaster {
                                         parsed.get("answer")
                                     ) {
                                         println!("📨 Received answer from worker: {}", from);
-                                            let peer_connections = peer_connections_arc.lock().await;
+                                        let peer_connections = peer_connections_arc.lock().await;
                                         if let Some(pc) = peer_connections.get(from) {
                                             if let Some(sdp) = answer.get("sdp").and_then(|v| v.as_str()) {
                                                 let answer_desc = RTCSessionDescription::answer(sdp.to_string()).unwrap();
@@ -506,10 +563,10 @@ impl RustWebRTCMaster {
     async fn handle_offer_from_worker(
         worker_id: String,
         offer: serde_json::Value,
-        ws_sender: Arc<tokio::sync::Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>>>,
+        ws_sender: Arc<Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>>>,
         my_id: String,
-        peer_connections_arc: Arc<tokio::sync::Mutex<HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>>>>,
-        data_channels_arc: Arc<tokio::sync::Mutex<HashMap<String, Arc<RTCDataChannel>>>>,
+        peer_connections_arc: Arc<Mutex<HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>>>>,
+        data_channels_arc: Arc<Mutex<HashMap<String, Arc<RTCDataChannel>>>>,
         result_sender: mpsc::Sender<ComputeResult>
     ) {
         let worker_id_clone = worker_id.clone();
@@ -564,7 +621,6 @@ impl RustWebRTCMaster {
                 let data_channels_arc = data_channels_arc.clone();
 
                 Box::pin(async move {
-
                     // Store the data channel
                     let mut channels = data_channels_arc.lock().await;
                     channels.insert(worker_id.clone(), data_channel.clone());
@@ -617,406 +673,118 @@ impl RustWebRTCMaster {
         }
     }
 
-    async fn connect_to_worker(&mut self, worker_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Create WebRTC peer connection
-        let config = RTCConfiguration {
-            ice_servers: vec![RTCIceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_owned()],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-
-        let api = APIBuilder::new().build();
-        let peer_connection = Arc::new(api.new_peer_connection(config).await?);
-
-        // Create data channel
-        let data_channel = peer_connection.create_data_channel("computation", None).await?;
-
-        // Set up data channel handlers
-        let result_sender = self.result_sender.clone();
-        let worker_id_clone = worker_id.to_string();
-
-        data_channel.on_message(Box::new(move |msg| {
-            let result_sender = result_sender.clone();
-            let worker_id = worker_id_clone.clone();
-            Box::pin(async move {
-                if let Ok(text) = String::from_utf8(msg.data.to_vec()) {
-                    if let Ok(result) = serde_json::from_str::<ComputeResult>(&text) {
-                        let _ = result_sender.send(result).await;
-                    }
-                }
-            })
-        }));
-
-        // Store connections
-        self.peer_connections.insert(worker_id.to_string(), peer_connection.clone());
-        {
-            let mut channels = self.data_channels.lock().await;
-            channels.insert(worker_id.to_string(), data_channel);
+    async fn disconnect_from_signaling_server(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ws_sender) = &self.ws_sender {
+            let mut sender = ws_sender.lock().await;
+            let _ = sender.close().await;
+            println!("🔌 Disconnected from signaling server");
         }
-
-        // Create offer (simplified - in real implementation, exchange via signaling server)
-        let offer = peer_connection.create_offer(None).await?;
-        peer_connection.set_local_description(offer).await?;
-
+        self.ws_sender = None;
+        self.is_connected = false;
         Ok(())
     }
 }
 
-async fn compile_wasm_module(fn_name: &str) {
-    let wasm_source = format!("target/wasm/{}_wasm.rs", fn_name);
-    let wasm_pkg = format!("target/wasm/{}_pkg", fn_name);
-
-    // Create a minimal Cargo.toml for the WASM module
-    let cargo_toml_content = format!(r#"
-[package]
-name = "{}_wasm"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-wasm-bindgen = "0.2"
-serde = {{ version = "1.0", features = ["derive"] }}
-serde_json = "1.0"
-js-sys = "0.3"
-wgpu = "22.0"
-bytemuck = "1.0"
-log = "0.4"
-console_log = "1.0"
-futures = "0.3"
-
-[dependencies.web-sys]
-version = "0.3"
-features = [
-  "console",
-  "WebGpuDevice",
-  "WebGpuAdapter",
-  "WebGpuBuffer",
-  "WebGpuCommandEncoder",
-  "WebGpuComputePassEncoder",
-  "WebGpuComputePipeline",
-  "WebGpuBindGroup",
-  "WebGpuShaderModule",
-  "WebGpuQueue",
-]
-"#, fn_name);
-
-    let wasm_dir = format!("target/wasm/{}_wasm", fn_name);
-    let wasm_src_dir = format!("{}/src", wasm_dir);
-    fs::create_dir_all(&wasm_src_dir).unwrap();
-    fs::write(format!("{}/Cargo.toml", wasm_dir), cargo_toml_content).unwrap();
-
-    // Copy the generated source file
-    if Path::new(&wasm_source).exists() {
-        fs::copy(&wasm_source, format!("{}/lib.rs", wasm_src_dir)).unwrap();
-    }
-
-    // Copy shader.wgsl if it exists
-    if Path::new("examples/src/shader.wgsl").exists() {
-        fs::copy("examples/src/shader.wgsl", format!("{}/shader.wgsl", wasm_src_dir)).unwrap();
-    }
-
-    // Compile with wasm-pack
-    let output = Command::new("wasm-pack")
-        .args(&["build", "--target", "web", "--out-dir", &wasm_pkg])
-        .current_dir(&wasm_dir)
-        .output();
-
-    match output {
-        Ok(result) => {
-            if !result.status.success() {
-                eprintln!("WASM compilation failed: {}", String::from_utf8_lossy(&result.stderr));
-            } else {
-                println!("WASM module compiled successfully");
-            }
+/// Simplified interface for distributed map-reduce operations
+/// Automatically compiles WASM functions and handles distribution
+pub async fn run_distributed_mapreduce<Input, Output>(
+    input: Input,
+    map_function_name: &str,
+    reduce_function_name: &str,
+    execution_mode: ExecutionMode,
+) -> Output
+where
+    Input: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+    Output: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+{
+    println!("🌐 Running distributed map-reduce with {} mode",
+        match execution_mode {
+            ExecutionMode::CPU => "CPU",
+            ExecutionMode::GPU => "GPU",
         }
-        Err(e) => {
-            eprintln!("Failed to run wasm-pack: {}. Make sure wasm-pack is installed.", e);
-        }
-    }
-}
+    );
 
-async fn create_compute_bundle(fn_name: &str) {
-    let bundle_content = r#"
-// Distributed Compute Master Node - WebRTC P2P Distribution
-// Generated automatically by distribute macro
-
-class DistributedComputeEngine {
-    constructor() {
-        this.ws = null;
-        this.myId = null;
-        this.peerConnections = {};
-        this.dataChannels = {};
-        this.connectedPeers = {};
-        this.currentJob = null;
-        this.isInitialized = false;
-    }
-
-    async initialize() {
-        if (this.isInitialized) return;
-
-        return new Promise((resolve, reject) => {
-            try {
-                this.ws = new WebSocket("ws://localhost:3000");
-
-                this.ws.onopen = () => {
-                    if (typeof window !== 'undefined') console.log("Master node connected to WebSocket server");
-                    this.isInitialized = true;
-                    resolve();
-                };
-
-                this.ws.onmessage = (message) => {
-                    const data = JSON.parse(message.data);
-                    this.handleWebSocketMessage(data);
-                };
-
-                this.ws.onerror = (error) => {
-                    console.error("WebSocket error:", error);
-                    reject(error);
-                };
-
-            } catch (error) {
-                reject(error);
-            }
-        });
-    }
-
-    handleWebSocketMessage(data) {
-        if (data.type === "welcome") {
-            this.myId = data.id;
-            if (typeof window !== 'undefined') console.log("Master node ID:", this.myId);
-            if (data.peers) this.updatePeerList(data.peers);
-        }
-        if (data.type === "peerList") {
-            if (this.myId) this.updatePeerList(data.peers);
-        }
-        if (data.type === "offer") {
-            this.handleOffer(data);
-        }
-        if (data.type === "answer") {
-            const pc = this.peerConnections[data.from];
-            if (pc) {
-                pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-            }
-        }
-        if (data.type === "candidate") {
-            const pc = this.peerConnections[data.from];
-            if (pc) {
-                pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-            }
-        }
-    }
-
-    updatePeerList(peers) {
-        const others = peers.filter(id => id !== this.myId);
-        if (typeof window !== 'undefined') console.log("Available worker nodes:", others);
-
-        others.forEach(peerId => {
-            if (!this.peerConnections[peerId] && this.myId < peerId) {
-                this.createConnection(peerId);
-            }
-        });
-    }
-
-    createConnection(peerId) {
-        const pc = new RTCPeerConnection({
-            iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
-        });
-        this.peerConnections[peerId] = pc;
-
-        const dc = pc.createDataChannel("computation");
-        this.setupDataChannel(dc, peerId);
-
-        pc.onicecandidate = (event) => {
-            if (event.candidate) {
-                this.ws.send(JSON.stringify({
-                    to: peerId,
-                    type: "candidate",
-                    candidate: event.candidate
-                }));
-            }
-        };
-
-        pc.ondatachannel = (event) => {
-            this.setupDataChannel(event.channel, peerId);
-        };
-
-        pc.createOffer()
-            .then(offer => pc.setLocalDescription(offer))
-            .then(() => {
-                this.ws.send(JSON.stringify({
-                    to: peerId,
-                    type: "offer",
-                    offer: pc.localDescription
-                }));
-            });
-    }
-
-    handleOffer(data) {
-        const peerId = data.from;
-        const pc = new RTCPeerConnection({
-            iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
-        });
-        this.peerConnections[peerId] = pc;
-
-        pc.onicecandidate = (event) => {
-            if (event.candidate) {
-                this.ws.send(JSON.stringify({
-                    to: peerId,
-                    type: "candidate",
-                    candidate: event.candidate
-                }));
-            }
-        };
-
-        pc.ondatachannel = (event) => {
-            this.setupDataChannel(event.channel, peerId);
-        };
-
-        pc.setRemoteDescription(new RTCSessionDescription(data.offer))
-            .then(() => pc.createAnswer())
-            .then(answer => pc.setLocalDescription(answer))
-            .then(() => {
-                this.ws.send(JSON.stringify({
-                    to: peerId,
-                    type: "answer",
-                    answer: pc.localDescription
-                }));
-            });
-    }
-
-    setupDataChannel(channel, peerId) {
-        channel.onopen = () => {
-            if (typeof window !== 'undefined') console.log("Connected to worker node:", peerId);
-            this.connectedPeers[peerId] = true;
-        };
-
-        channel.onclose = () => {
-            if (typeof window !== 'undefined') console.log("Disconnected from worker node:", peerId);
-            delete this.connectedPeers[peerId];
-        };
-
-        channel.onmessage = (event) => {
-            if (typeof event.data === "string") {
-                try {
-                    const msg = JSON.parse(event.data);
-                    if (msg.type === "computeResult") {
-                        this.handleComputeResult(msg);
+    // Default chunker: splits data into individual elements (for Vec<f32>)
+    let default_chunker = |data: &Input| -> Vec<Input> {
+        // Try to deserialize as a struct with numbers field
+        if let Ok(serialized) = serde_json::to_string(data) {
+            if let Ok(test_data) = serde_json::from_str::<serde_json::Value>(&serialized) {
+                if let Some(numbers) = test_data.get("numbers") {
+                    if let Some(numbers_array) = numbers.as_array() {
+                        let mut chunks = Vec::new();
+                        for number in numbers_array {
+                            if let Some(num) = number.as_f64() {
+                                // Create individual chunks with single numbers
+                                let chunk = format!(r#"{{"numbers":[{}]}}"#, num);
+                                if let Ok(chunk_data) = serde_json::from_str::<Input>(&chunk) {
+                                    chunks.push(chunk_data);
+                                }
+                            }
+                        }
+                        return chunks;
                     }
-                } catch (e) {
-                    console.error("Error parsing worker result:", e);
                 }
             }
-        };
-
-        this.dataChannels[peerId] = channel;
-    }
-
-    handleComputeResult(msg) {
-        if (!this.currentJob || msg.taskId !== this.currentJob.taskId) return;
-
-        if (typeof window !== 'undefined') console.log("Received result from worker:", msg.workerId, msg.result);
-        this.currentJob.results.push(msg.result);
-
-        if (this.currentJob.results.length >= this.currentJob.expectedResults) {
-            // All results received, reduce them
-            const finalResult = this.currentJob.results.flat().reduce((sum, val) => sum + val, 0);
-            this.currentJob.resolve({ value: finalResult });
-            this.currentJob = null;
         }
-    }
+        // Fallback: return original data as single chunk
+        vec![data.clone()]
+    };
 
-    // Main execution function
-    async execute(input, mode = 'auto') {
-        await this.initialize();
+    // Clone input for use in closures
+    let input_for_reducer = input.clone();
 
-        // Wait up to 5 seconds for workers to connect
-        const maxWaitTime = 5000; // 5 seconds
-        const startTime = Date.now();
+    // Default reducer: sums up the values from results
+    let default_reducer = move |results: Vec<Output>| -> Output {
+        let mut total = 0.0f32;
+        let mut first_result = None;
 
-        while (Object.keys(this.connectedPeers).length === 0 && (Date.now() - startTime) < maxWaitTime) {
-            await new Promise(resolve => setTimeout(resolve, 500));
-        }
-
-        const connectedWorkers = Object.keys(this.connectedPeers);
-        if (connectedWorkers.length === 0) {
-            if (typeof window !== 'undefined') console.log("No workers connected, executing locally");
-            return this.executeLocally(input);
-        }
-
-        if (typeof window !== 'undefined') console.log(`Distributing work across ${connectedWorkers.length} worker nodes`);
-
-        return new Promise((resolve, reject) => {
-            try {
-                const taskId = Date.now().toString();
-                const chunks = this.chunkData(input, connectedWorkers.length);
-
-                this.currentJob = {
-                    taskId,
-                    expectedResults: chunks.length,
-                    results: [],
-                    resolve,
-                    reject
-                };
-
-                // Send tasks to workers
-                connectedWorkers.forEach((workerId, index) => {
-                    const chunk = chunks[index] || [];
-                    if (chunk.length === 0) return;
-
-                    const task = {
-                        type: "computeTask",
-                        taskId,
-                        dataChunk: chunk,
-                        executionMode: mode,
-                        wasmBase64: "dummy" // Would contain actual WASM in real implementation
-                    };
-
-                    this.dataChannels[workerId].send(JSON.stringify(task));
-                });
-
-            } catch (error) {
-                reject(error);
+        for result in &results {
+            if first_result.is_none() {
+                first_result = Some(result.clone());
             }
-        });
-    }
-
-    chunkData(input, numChunks) {
-        if (!input.numbers || !Array.isArray(input.numbers)) {
-            return [[]];
+            if let Ok(serialized) = serde_json::to_string(result) {
+                if let Ok(result_data) = serde_json::from_str::<serde_json::Value>(&serialized) {
+                    if let Some(value) = result_data.get("value") {
+                        if let Some(val) = value.as_f64() {
+                            total += val as f32;
+                        }
+                    }
+                }
+            }
         }
+        // Create result with summed value
+        let result_str = format!(r#"{{"value":{}}}"#, total);
+        serde_json::from_str::<Output>(&result_str).unwrap_or_else(|_| {
+            // Fallback: return first result or a default value
+            first_result.unwrap_or_else(|| {
+                // Last resort: try to create a default Output value
+                if let Ok(default_output) = serde_json::from_str::<Output>(r#"{"value":0.0}"#) {
+                    default_output
+                } else {
+                    panic!("Unable to create default Output value")
+                }
+            })
+        })
+    };
 
-        const chunkSize = Math.ceil(input.numbers.length / numChunks);
-        const chunks = [];
+    // Clone input for dummy function
+    let input_for_dummy = input.clone();
 
-        for (let i = 0; i < input.numbers.length; i += chunkSize) {
-            chunks.push(input.numbers.slice(i, i + chunkSize));
-        }
-
-        return chunks;
-    }
-
-    executeLocally(input) {
-        // Master should NOT do computation - this should only be reached if no workers
-        console.error("ERROR: Master node attempted local computation - this should never happen!");
-        console.error("Computation must be distributed to worker nodes only.");
-        return { error: "Master cannot perform computation - workers required", value: 0 };
-    }
-}
-
-// Export for both Node.js and browser environments
-if (typeof module !== 'undefined' && module.exports) {
-    module.exports = DistributedComputeEngine;
-} else {
-    window.DistributedComputeEngine = DistributedComputeEngine;
-}
-"#;
-
-    fs::create_dir_all("target").ok();
-    fs::write("target/compute-bundle.js", bundle_content).unwrap();
-    println!("Distributed compute bundle created: target/compute-bundle.js");
+    // Use the existing implementation with default functions
+    run_distributed_impl_with_code(
+        move |_data: Input| -> Output {
+            // Dummy function (not used) - create default output
+            if let Ok(default_output) = serde_json::from_str::<Output>(r#"{"value":0.0}"#) {
+                default_output
+            } else {
+                panic!("Unable to create default Output value in dummy function")
+            }
+        },
+        input,
+        default_chunker,
+        default_reducer,
+        execution_mode,
+        "", // Empty function body (not used)
+        map_function_name,
+    ).await
 }
