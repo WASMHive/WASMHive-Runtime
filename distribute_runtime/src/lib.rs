@@ -3,10 +3,9 @@ use std::process::Command;
 use std::fs;
 use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_server::RTCIceServer;
-use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
+use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::data_channel::RTCDataChannel;
 use futures_util::{StreamExt, SinkExt};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -14,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use std::collections::HashMap;
-use base64;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 
 #[derive(Debug, Clone)]
 pub enum ExecutionMode {
@@ -153,34 +152,8 @@ where
     }
 }
 
-async fn local_distributed_execution<F, Input, Output, ChunkFn, ReduceFn>(
-    compute_fn: F,
-    input: Input,
-    chunker: ChunkFn,
-    reducer: ReduceFn,
-) -> Output
-where
-    F: ComputeFunction<Input, Output>,
-    ChunkFn: Fn(&Input) -> Vec<Input>,
-    ReduceFn: Fn(Vec<Output>) -> Output,
-{
-    let chunks = chunker(&input);
-    let chunk_count = chunks.len();
-    println!("📦 Split input into {} chunks", chunk_count);
 
-    let mut results = Vec::new();
-    for (i, chunk) in chunks.into_iter().enumerate() {
-        println!("⚡ Processing chunk {} of {}", i + 1, chunk_count);
-        let result = compute_fn.call(chunk);
-        results.push(result);
-    }
-
-    let final_result = reducer(results);
-    println!("✅ Local distributed computation completed");
-    final_result
-}
-
-async fn compile_examples_to_wasm(fn_name: &str) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
+async fn compile_examples_to_wasm(_fn_name: &str) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
     println!("🔧 Compiling examples to WASM for distributed execution...");
 
     // Get current directory and find examples path
@@ -269,7 +242,7 @@ impl DistributedCompute {
         })
     }
 
-    async fn execute_map_reduce(&mut self, input_json: &str, execution_mode: &ExecutionMode, wasm_bytes: &[u8], js_glue: &str, fn_name: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn execute_map_reduce(&mut self, input_json: &str, execution_mode: &ExecutionMode, wasm_bytes: &[u8], js_glue: &str, _fn_name: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         // Parse input
         let input: TestDataForCalculation = serde_json::from_str(input_json)?;
 
@@ -314,7 +287,7 @@ impl DistributedCompute {
         let mut tasks = Vec::new();
 
         // Encode WASM as base64
-        let wasm_b64 = base64::encode(wasm_bytes);
+        let wasm_b64 = BASE64.encode(wasm_bytes);
 
         for (i, worker_id) in connected_workers.iter().enumerate() {
             let start_idx = i * chunk_size;
@@ -690,7 +663,7 @@ impl DistributedCompute {
 pub async fn run_distributed_mapreduce<Input, Output>(
     input: Input,
     map_function_name: &str,
-    reduce_function_name: &str,
+    _reduce_function_name: &str,
     execution_mode: ExecutionMode,
 ) -> Output
 where
@@ -730,9 +703,6 @@ where
         vec![data.clone()]
     };
 
-    // Clone input for use in closures
-    let input_for_reducer = input.clone();
-
     // Default reducer: sums up the values from results
     let default_reducer = move |results: Vec<Output>| -> Output {
         let mut total = 0.0f32;
@@ -766,9 +736,6 @@ where
             })
         })
     };
-
-    // Clone input for dummy function
-    let input_for_dummy = input.clone();
 
     // Use the existing implementation with default functions
     run_distributed_impl_with_code(

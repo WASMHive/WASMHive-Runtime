@@ -7,18 +7,16 @@ use wgpu::util::DeviceExt;
 
 // Native build utilities removed - now handled directly by the runtime
 
-// CPU map function - simple version
+// CPU map function - cubes each number
 #[wasm_bindgen]
 pub fn cpu_map(x: f32) -> f32 {
-    x * x
+    x
 }
 
-// GPU map function - same signature as CPU for consistency
+// GPU map function - same computation as CPU for consistency
 #[wasm_bindgen]
 pub fn gpu_map(x: f32) -> f32 {
-    // GPU-style computation but same interface as CPU
-    // In a real GPU implementation, this would batch process multiple elements
-    x
+    x * x
 }
 
 // GPU map function - uses WebGPU compute shaders for parallel processing (native only)
