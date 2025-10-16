@@ -59,37 +59,25 @@ pub async fn gpu_map(input: Vec<f32>) -> Vec<f32> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
 
     info!("🔍 Requesting WebGPU adapter...");
-    let adapter = match instance
+    let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions::default())
         .await
-    {
-        Ok(adapter) => {
-            info!("✅ WebGPU adapter created successfully");
-            adapter
-        }
-        Err(e) => {
-            info!("❌ Failed to create WebGPU adapter: {:?}", e);
-            info!("🔄 Falling back to CPU computation");
-            // Fallback to CPU computation
-            return input.iter().map(|&x| x * x).collect();
-        }
-    };
+        .expect("Failed to create WebGPU adapter");
+    info!("✅ WebGPU adapter created successfully");
 
     let downlevel_capabilities = adapter.get_downlevel_capabilities();
-    if !downlevel_capabilities
-        .flags
-        .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
-    {
-        info!("❌ Adapter does not support compute shaders");
-        info!("🔄 Falling back to CPU computation");
-        return input.iter().map(|&x| x * x).collect();
-    }
+    assert!(
+        downlevel_capabilities
+            .flags
+            .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS),
+        "Adapter does not support compute shaders"
+    );
     info!("✅ Compute shaders supported");
 
     info!("🔧 Requesting WebGPU device...");
     // Use the adapter's supported limits to avoid compatibility issues
     let adapter_limits = adapter.limits();
-    let (device, queue) = match adapter
+    let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: None,
             required_features: wgpu::Features::empty(),
@@ -98,17 +86,8 @@ pub async fn gpu_map(input: Vec<f32>) -> Vec<f32> {
             trace: wgpu::Trace::Off,
         })
         .await
-    {
-        Ok((device, queue)) => {
-            info!("✅ WebGPU device created successfully");
-            (device, queue)
-        }
-        Err(e) => {
-            info!("❌ Failed to create device: {:?}", e);
-            info!("🔄 Falling back to CPU computation");
-            return input.iter().map(|&x| x * x).collect();
-        }
-    };
+        .expect("Failed to create WebGPU device");
+    info!("✅ WebGPU device created successfully");
 
     let module = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
@@ -224,21 +203,11 @@ pub async fn gpu_map(input: Vec<f32>) -> Vec<f32> {
     let _ = device.poll(wgpu::PollType::Wait);
 
     // Await the mapping result
-    match receiver.await {
-        Ok(Ok(())) => {
-            info!("✅ Buffer mapped successfully");
-        }
-        Ok(Err(e)) => {
-            info!("❌ Buffer mapping error: {:?}", e);
-            info!("🔄 Falling back to CPU computation");
-            return input.iter().map(|&x| x * x).collect();
-        }
-        Err(e) => {
-            info!("❌ Failed to receive mapping result: {:?}", e);
-            info!("🔄 Falling back to CPU computation");
-            return input.iter().map(|&x| x * x).collect();
-        }
-    }
+    receiver
+        .await
+        .expect("Failed to receive mapping result")
+        .expect("Buffer mapping error");
+    info!("✅ Buffer mapped successfully");
 
     let data = buffer_slice.get_mapped_range();
     let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
