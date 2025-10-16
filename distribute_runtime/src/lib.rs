@@ -1,19 +1,19 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::process::Command;
+use std::collections::HashMap;
 use std::fs;
-use webrtc::api::APIBuilder;
-use webrtc::ice_transport::ice_server::RTCIceServer;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::data_channel::RTCDataChannel;
-use futures_util::{StreamExt, SinkExt};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use std::process::Command;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-use std::sync::Arc;
-use std::collections::HashMap;
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use webrtc::api::APIBuilder;
+use webrtc::data_channel::RTCDataChannel;
+use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 #[derive(Debug, Clone)]
 pub enum ExecutionMode {
@@ -26,15 +26,30 @@ pub enum ExecutionMode {
 #[serde(tag = "type")]
 enum SignalingMessage {
     #[serde(rename = "welcome")]
-    Welcome { id: String, peers: Option<Vec<String>> },
+    Welcome {
+        id: String,
+        peers: Option<Vec<String>>,
+    },
     #[serde(rename = "peerList")]
     PeerList { peers: Vec<String> },
     #[serde(rename = "offer")]
-    Offer { from: String, to: String, offer: serde_json::Value },
+    Offer {
+        from: String,
+        to: String,
+        offer: serde_json::Value,
+    },
     #[serde(rename = "answer")]
-    Answer { from: String, to: String, answer: serde_json::Value },
+    Answer {
+        from: String,
+        to: String,
+        answer: serde_json::Value,
+    },
     #[serde(rename = "candidate")]
-    Candidate { from: String, to: String, candidate: serde_json::Value },
+    Candidate {
+        from: String,
+        to: String,
+        candidate: serde_json::Value,
+    },
 }
 
 // Compute task message
@@ -45,6 +60,15 @@ struct ComputeTask {
     js_glue: String,
     data_chunk: Vec<f32>,
     map_function: String, // "cpu_map" or "gpu_map"
+}
+
+// Chunk message for large data transfers
+#[derive(Serialize, Deserialize, Debug)]
+struct ChunkMessage {
+    chunk_id: String,      // Unique ID for this chunked message
+    chunk_index: usize,    // Index of this chunk (0-based)
+    total_chunks: usize,   // Total number of chunks
+    data: String,          // Base64 encoded chunk data
 }
 
 // Compute result message
@@ -74,40 +98,6 @@ where
     }
 }
 
-pub async fn run_distributed_impl<F, Input, Output, ChunkFn, ReduceFn>(
-    compute_fn: F,
-    input: Input,
-    chunker: ChunkFn,
-    reducer: ReduceFn,
-    _execution_mode: ExecutionMode,
-) -> Output
-where
-    F: ComputeFunction<Input, Output> + Send + Sync + 'static,
-    Input: Serialize + for<'de> Deserialize<'de> + Clone + Send + 'static,
-    Output: Serialize + for<'de> Deserialize<'de> + Send + 'static,
-    ChunkFn: Fn(&Input) -> Vec<Input> + Send + Sync,
-    ReduceFn: Fn(Vec<Output>) -> Output + Send + Sync,
-{
-    // For now, fall back to local execution
-    // TODO: Implement distributed execution using the examples WASM
-    println!("🌐 Executing distributed computation using examples function...");
-
-    let chunks = chunker(&input);
-    println!("📦 Split input into {} chunks", chunks.len());
-
-    let mut results = Vec::new();
-    for (i, chunk) in chunks.iter().enumerate() {
-        println!("⚡ Processing chunk {} of {}", i + 1, chunks.len());
-        let result = compute_fn.call(chunk.clone());
-        results.push(result);
-    }
-
-    let final_result = reducer(results);
-    println!("✅ Distributed computation completed");
-
-    final_result
-}
-
 pub async fn run_distributed_impl_with_code<F, Input, Output, ChunkFn, ReduceFn>(
     _compute_fn: F,
     input: Input,
@@ -129,11 +119,21 @@ where
     // Compile WASM from examples directory
     match compile_examples_to_wasm(fn_name).await {
         Ok((wasm_bytes, js_glue)) => {
-            println!("📦 Successfully compiled examples to WASM ({} bytes)", wasm_bytes.len());
+            println!(
+                "📦 Successfully compiled examples to WASM ({} bytes)",
+                wasm_bytes.len()
+            );
 
             // Execute distributed map-reduce using compiled WASM
             let input_json = serde_json::to_string(&input).unwrap();
-            let result = execute_distributed_map_reduce(&input_json, &execution_mode, &wasm_bytes, &js_glue, fn_name).await;
+            let result = execute_distributed_map_reduce(
+                &input_json,
+                &execution_mode,
+                &wasm_bytes,
+                &js_glue,
+                fn_name,
+            )
+            .await;
 
             match serde_json::from_str(&result) {
                 Ok(parsed) => parsed,
@@ -152,8 +152,9 @@ where
     }
 }
 
-
-async fn compile_examples_to_wasm(_fn_name: &str) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
+async fn compile_examples_to_wasm(
+    _fn_name: &str,
+) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
     println!("🔧 Compiling examples to WASM for distributed execution...");
 
     // Get current directory and find examples path
@@ -180,7 +181,9 @@ async fn compile_examples_to_wasm(_fn_name: &str) -> Result<(Vec<u8>, String), B
     println!("✅ WASM compilation successful");
 
     // Read the compiled WASM file and JS glue
-    let wasm_file_path = examples_dir.join("pkg").join("distributed_examples_bg.wasm");
+    let wasm_file_path = examples_dir
+        .join("pkg")
+        .join("distributed_examples_bg.wasm");
     let js_file_path = examples_dir.join("pkg").join("distributed_examples.js");
 
     let wasm_bytes = fs::read(&wasm_file_path)?;
@@ -192,7 +195,13 @@ async fn compile_examples_to_wasm(_fn_name: &str) -> Result<(Vec<u8>, String), B
     Ok((wasm_bytes, js_glue))
 }
 
-async fn execute_distributed_map_reduce(input_json: &str, execution_mode: &ExecutionMode, wasm_bytes: &[u8], js_glue: &str, fn_name: &str) -> String {
+async fn execute_distributed_map_reduce(
+    input_json: &str,
+    execution_mode: &ExecutionMode,
+    wasm_bytes: &[u8],
+    js_glue: &str,
+    fn_name: &str,
+) -> String {
     println!("🌐 Starting distributed map-reduce execution...");
 
     let mut distributor = match DistributedCompute::new().await {
@@ -203,7 +212,10 @@ async fn execute_distributed_map_reduce(input_json: &str, execution_mode: &Execu
         }
     };
 
-    match distributor.execute_map_reduce(input_json, execution_mode, wasm_bytes, js_glue, fn_name).await {
+    match distributor
+        .execute_map_reduce(input_json, execution_mode, wasm_bytes, js_glue, fn_name)
+        .await
+    {
         Ok(result) => result,
         Err(e) => {
             eprintln!("Distributed map-reduce execution failed: {}", e);
@@ -222,7 +234,18 @@ pub struct DistributedCompute {
     result_receiver: Option<mpsc::Receiver<ComputeResult>>,
     result_sender: mpsc::Sender<ComputeResult>,
     is_connected: bool,
-    ws_sender: Option<Arc<Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>>>>,
+    ws_sender: Option<
+        Arc<
+            Mutex<
+                futures_util::stream::SplitSink<
+                    tokio_tungstenite::WebSocketStream<
+                        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                    >,
+                    Message,
+                >,
+            >,
+        >,
+    >,
 }
 
 impl DistributedCompute {
@@ -242,7 +265,71 @@ impl DistributedCompute {
         })
     }
 
-    async fn execute_map_reduce(&mut self, input_json: &str, execution_mode: &ExecutionMode, wasm_bytes: &[u8], js_glue: &str, _fn_name: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // Helper function to send message with automatic chunking if needed
+    async fn send_message_chunked(
+        channel: &Arc<RTCDataChannel>,
+        message: &str,
+        chunk_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        const MAX_CHUNK_SIZE: usize = 30_000; // 30KB chunks (after base64 encoding + JSON overhead will be ~40KB)
+
+        if message.len() <= MAX_CHUNK_SIZE {
+            // Message is small enough, send directly
+            channel.send_text(message).await?;
+            println!("   📤 Sent message directly ({} bytes)", message.len());
+            return Ok(());
+        }
+
+        // Message is too large, split into chunks
+        let message_bytes = message.as_bytes();
+        let total_chunks = (message_bytes.len() + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE;
+
+        println!(
+            "   📦 Splitting large message into {} chunks ({} bytes total)",
+            total_chunks,
+            message_bytes.len()
+        );
+
+        for chunk_index in 0..total_chunks {
+            let start = chunk_index * MAX_CHUNK_SIZE;
+            let end = (start + MAX_CHUNK_SIZE).min(message_bytes.len());
+            let chunk_data = &message_bytes[start..end];
+
+            // Encode chunk as base64
+            let chunk_b64 = BASE64.encode(chunk_data);
+
+            let chunk_message = ChunkMessage {
+                chunk_id: chunk_id.to_string(),
+                chunk_index,
+                total_chunks,
+                data: chunk_b64,
+            };
+
+            let chunk_json = serde_json::to_string(&chunk_message)?;
+            channel.send_text(&chunk_json).await?;
+
+            println!(
+                "   📤 Sent chunk {}/{} ({} bytes)",
+                chunk_index + 1,
+                total_chunks,
+                chunk_data.len()
+            );
+
+            // Small delay between chunks to avoid overwhelming the channel
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+
+        Ok(())
+    }
+
+    async fn execute_map_reduce(
+        &mut self,
+        input_json: &str,
+        execution_mode: &ExecutionMode,
+        wasm_bytes: &[u8],
+        js_glue: &str,
+        _fn_name: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         // Parse input
         let input: TestDataForCalculation = serde_json::from_str(input_json)?;
 
@@ -271,7 +358,8 @@ impl DistributedCompute {
         // Filter workers to only include those with actual data channels
         let connected_workers = {
             let data_channels = self.data_channels.lock().await;
-            workers_list.into_iter()
+            workers_list
+                .into_iter()
                 .filter(|worker_id| data_channels.contains_key(worker_id))
                 .collect::<Vec<_>>()
         };
@@ -316,16 +404,30 @@ impl DistributedCompute {
 
         // Send tasks to workers via WebRTC data channels
         let mut sent_tasks = 0;
-        println!("📊 Distributing to {} connected workers: {:?}", connected_workers.len(), connected_workers);
+        println!(
+            "📊 Distributing to {} connected workers: {:?}",
+            connected_workers.len(),
+            connected_workers
+        );
 
         for (worker_id, task) in &tasks {
             let data_channels = self.data_channels.lock().await;
             if let Some(channel) = data_channels.get(worker_id) {
-                println!("🔍 Attempting to send task to {}, channel state: ready", worker_id);
+                println!(
+                    "🔍 Attempting to send task to {}, channel state: ready",
+                    worker_id
+                );
                 let task_json = serde_json::to_string(task).unwrap();
-                match channel.send_text(&task_json).await {
+
+                // Use chunked sending for large messages
+                match Self::send_message_chunked(channel, &task_json, &task.task_id).await {
                     Ok(_) => {
-                        println!("   ✅ {} -> {} ({} elements)", task.task_id, worker_id, task.data_chunk.len());
+                        println!(
+                            "   ✅ {} -> {} ({} elements)",
+                            task.task_id,
+                            worker_id,
+                            task.data_chunk.len()
+                        );
                         sent_tasks += 1;
                     }
                     Err(e) => {
@@ -349,9 +451,19 @@ impl DistributedCompute {
             let mut results_received = 0;
             while results_received < sent_tasks && start_time.elapsed() < timeout {
                 if let Some(mut receiver) = self.result_receiver.take() {
-                    match tokio::time::timeout(tokio::time::Duration::from_millis(1000), receiver.recv()).await {
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_millis(1000),
+                        receiver.recv(),
+                    )
+                    .await
+                    {
                         Ok(Some(result)) => {
-                            println!("   📥 {} returned {} values: {:?}", result.worker_id, result.result.len(), result.result);
+                            println!(
+                                "   📥 {} returned {} values: {:?}",
+                                result.worker_id,
+                                result.result.len(),
+                                result.result
+                            );
                             collected_results.extend(result.result);
                             results_received += 1;
                         }
@@ -360,7 +472,10 @@ impl DistributedCompute {
                             break; // Channel closed
                         }
                         Err(_) => {
-                            println!("   ⏱️  Waiting for more results... ({}/{})", results_received, sent_tasks);
+                            println!(
+                                "   ⏱️  Waiting for more results... ({}/{})",
+                                results_received, sent_tasks
+                            );
                         } // Timeout, continue waiting
                     }
                     self.result_receiver = Some(receiver);
@@ -370,14 +485,20 @@ impl DistributedCompute {
             if results_received == sent_tasks {
                 // Use local WASM reduce function to combine results
                 let final_result = self.reduce_results_with_wasm(&collected_results).await?;
-                println!("✅ All {} workers completed! Distributed result: {}", sent_tasks, final_result);
+                println!(
+                    "✅ All {} workers completed! Distributed result: {}",
+                    sent_tasks, final_result
+                );
 
                 // Disconnect from signaling server after successful job completion
                 self.disconnect_from_signaling_server().await?;
 
                 return Ok(format!(r#"{{"value": {}}}"#, final_result));
             } else {
-                println!("❌ Only {}/{} workers returned results - distributed execution failed", results_received, sent_tasks);
+                println!(
+                    "❌ Only {}/{} workers returned results - distributed execution failed",
+                    results_received, sent_tasks
+                );
             }
         }
 
@@ -388,8 +509,14 @@ impl DistributedCompute {
         Err("Failed to get results from distributed workers - remote execution required".into())
     }
 
-    async fn reduce_results_with_wasm(&self, results: &[f32]) -> Result<f32, Box<dyn std::error::Error + Send + Sync>> {
-        println!("🔧 Using local WASM reduce function to combine {} values", results.len());
+    async fn reduce_results_with_wasm(
+        &self,
+        results: &[f32],
+    ) -> Result<f32, Box<dyn std::error::Error + Send + Sync>> {
+        println!(
+            "🔧 Using local WASM reduce function to combine {} values",
+            results.len()
+        );
 
         if results.is_empty() {
             return Ok(0.0);
@@ -403,7 +530,9 @@ impl DistributedCompute {
         Ok(total)
     }
 
-    async fn connect_to_signaling_server(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn connect_to_signaling_server(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let url = url::Url::parse(&self.ws_url)?;
         let (ws_stream, _) = connect_async(url).await?;
         let (ws_sender, mut ws_receiver) = ws_stream.split();
@@ -440,9 +569,12 @@ impl DistributedCompute {
                                         let mut my_id = my_id_arc.lock().await;
                                         *my_id = Some(id.to_string());
 
-                                        if let Some(peers) = parsed.get("peers").and_then(|v| v.as_array()) {
+                                        if let Some(peers) =
+                                            parsed.get("peers").and_then(|v| v.as_array())
+                                        {
                                             let mut workers = workers_arc.lock().await;
-                                            *workers = peers.iter()
+                                            *workers = peers
+                                                .iter()
                                                 .filter_map(|p| p.as_str())
                                                 .filter(|&p| p != id)
                                                 .map(|s| s.to_string())
@@ -451,12 +583,16 @@ impl DistributedCompute {
                                     }
                                 }
                                 "peerList" => {
-                                    if let Some(peers) = parsed.get("peers").and_then(|v| v.as_array()) {
+                                    if let Some(peers) =
+                                        parsed.get("peers").and_then(|v| v.as_array())
+                                    {
                                         let my_id = my_id_arc.lock().await;
-                                        let current_id = my_id.as_ref().map(|s| s.as_str()).unwrap_or("");
+                                        let current_id =
+                                            my_id.as_ref().map(|s| s.as_str()).unwrap_or("");
 
                                         let mut workers = workers_arc.lock().await;
-                                        *workers = peers.iter()
+                                        *workers = peers
+                                            .iter()
                                             .filter_map(|p| p.as_str())
                                             .filter(|&p| p != current_id)
                                             .map(|s| s.to_string())
@@ -468,7 +604,7 @@ impl DistributedCompute {
                                     if let (Some(from), Some(to), Some(offer)) = (
                                         parsed.get("from").and_then(|v| v.as_str()),
                                         parsed.get("to").and_then(|v| v.as_str()),
-                                        parsed.get("offer")
+                                        parsed.get("offer"),
                                     ) {
                                         let my_id = my_id_arc.lock().await;
                                         if let Some(ref current_id) = *my_id {
@@ -480,8 +616,9 @@ impl DistributedCompute {
                                                     current_id.clone(),
                                                     peer_connections_arc.clone(),
                                                     data_channels_arc.clone(),
-                                                    result_sender.clone()
-                                                ).await;
+                                                    result_sender.clone(),
+                                                )
+                                                .await;
                                             }
                                         }
                                     }
@@ -490,14 +627,19 @@ impl DistributedCompute {
                                     // Handle answer from worker
                                     if let (Some(from), Some(answer)) = (
                                         parsed.get("from").and_then(|v| v.as_str()),
-                                        parsed.get("answer")
+                                        parsed.get("answer"),
                                     ) {
                                         println!("📨 Received answer from worker: {}", from);
                                         let peer_connections = peer_connections_arc.lock().await;
                                         if let Some(pc) = peer_connections.get(from) {
-                                            if let Some(sdp) = answer.get("sdp").and_then(|v| v.as_str()) {
-                                                let answer_desc = RTCSessionDescription::answer(sdp.to_string()).unwrap();
-                                                let _ = pc.set_remote_description(answer_desc).await;
+                                            if let Some(sdp) =
+                                                answer.get("sdp").and_then(|v| v.as_str())
+                                            {
+                                                let answer_desc =
+                                                    RTCSessionDescription::answer(sdp.to_string())
+                                                        .unwrap();
+                                                let _ =
+                                                    pc.set_remote_description(answer_desc).await;
                                             }
                                         }
                                     }
@@ -506,18 +648,21 @@ impl DistributedCompute {
                                     // Handle ICE candidate from worker
                                     if let (Some(from), Some(candidate)) = (
                                         parsed.get("from").and_then(|v| v.as_str()),
-                                        parsed.get("candidate")
+                                        parsed.get("candidate"),
                                     ) {
                                         let peer_connections = peer_connections_arc.lock().await;
                                         if let Some(pc) = peer_connections.get(from) {
-                                            if let Some(candidate_str) = candidate.get("candidate").and_then(|v| v.as_str()) {
+                                            if let Some(candidate_str) =
+                                                candidate.get("candidate").and_then(|v| v.as_str())
+                                            {
                                                 let ice_candidate_init = RTCIceCandidateInit {
                                                     candidate: candidate_str.to_string(),
                                                     sdp_mid: Some("0".to_string()),
                                                     sdp_mline_index: Some(0),
                                                     username_fragment: None,
                                                 };
-                                                let _ = pc.add_ice_candidate(ice_candidate_init).await;
+                                                let _ =
+                                                    pc.add_ice_candidate(ice_candidate_init).await;
                                             }
                                         }
                                     }
@@ -536,11 +681,22 @@ impl DistributedCompute {
     async fn handle_offer_from_worker(
         worker_id: String,
         offer: serde_json::Value,
-        ws_sender: Arc<Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>>>,
+        ws_sender: Arc<
+            Mutex<
+                futures_util::stream::SplitSink<
+                    tokio_tungstenite::WebSocketStream<
+                        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                    >,
+                    Message,
+                >,
+            >,
+        >,
         my_id: String,
-        peer_connections_arc: Arc<Mutex<HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>>>>,
+        peer_connections_arc: Arc<
+            Mutex<HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>>>,
+        >,
         data_channels_arc: Arc<Mutex<HashMap<String, Arc<RTCDataChannel>>>>,
-        result_sender: mpsc::Sender<ComputeResult>
+        result_sender: mpsc::Sender<ComputeResult>,
     ) {
         let worker_id_clone = worker_id.clone();
         let worker_id_clone2 = worker_id.clone();
@@ -646,7 +802,9 @@ impl DistributedCompute {
         }
     }
 
-    async fn disconnect_from_signaling_server(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn disconnect_from_signaling_server(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(ws_sender) = &self.ws_sender {
             let mut sender = ws_sender.lock().await;
             let _ = sender.close().await;
@@ -660,98 +818,39 @@ impl DistributedCompute {
 
 /// Simplified interface for distributed map-reduce operations
 /// Automatically compiles WASM functions and handles distribution
-pub async fn run_distributed_mapreduce<Input, Output>(
+pub async fn run_distributed_mapreduce<Input, Output, ChunkFn, ReduceFn>(
     input: Input,
     map_function_name: &str,
-    _reduce_function_name: &str,
+    chunker: ChunkFn,
+    reducer: ReduceFn,
     execution_mode: ExecutionMode,
 ) -> Output
 where
     Input: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
     Output: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+    ChunkFn: Fn(&Input) -> Vec<Input> + Send + Sync,
+    ReduceFn: Fn(Vec<Output>) -> Output + Send + Sync,
 {
-    println!("🌐 Running distributed map-reduce with {} mode",
+    println!(
+        "🌐 Running distributed map-reduce with {} mode",
         match execution_mode {
             ExecutionMode::CPU => "CPU",
             ExecutionMode::GPU => "GPU",
         }
     );
 
-    // Default chunker: splits data into individual elements (for Vec<f32>)
-    let default_chunker = |data: &Input| -> Vec<Input> {
-        // Try to deserialize as a struct with numbers field
-        if let Ok(serialized) = serde_json::to_string(data) {
-            if let Ok(test_data) = serde_json::from_str::<serde_json::Value>(&serialized) {
-                if let Some(numbers) = test_data.get("numbers") {
-                    if let Some(numbers_array) = numbers.as_array() {
-                        let mut chunks = Vec::new();
-                        for number in numbers_array {
-                            if let Some(num) = number.as_f64() {
-                                // Create individual chunks with single numbers
-                                let chunk = format!(r#"{{"numbers":[{}]}}"#, num);
-                                if let Ok(chunk_data) = serde_json::from_str::<Input>(&chunk) {
-                                    chunks.push(chunk_data);
-                                }
-                            }
-                        }
-                        return chunks;
-                    }
-                }
-            }
-        }
-        // Fallback: return original data as single chunk
-        vec![data.clone()]
-    };
-
-    // Default reducer: sums up the values from results
-    let default_reducer = move |results: Vec<Output>| -> Output {
-        let mut total = 0.0f32;
-        let mut first_result = None;
-
-        for result in &results {
-            if first_result.is_none() {
-                first_result = Some(result.clone());
-            }
-            if let Ok(serialized) = serde_json::to_string(result) {
-                if let Ok(result_data) = serde_json::from_str::<serde_json::Value>(&serialized) {
-                    if let Some(value) = result_data.get("value") {
-                        if let Some(val) = value.as_f64() {
-                            total += val as f32;
-                        }
-                    }
-                }
-            }
-        }
-        // Create result with summed value
-        let result_str = format!(r#"{{"value":{}}}"#, total);
-        serde_json::from_str::<Output>(&result_str).unwrap_or_else(|_| {
-            // Fallback: return first result or a default value
-            first_result.unwrap_or_else(|| {
-                // Last resort: try to create a default Output value
-                if let Ok(default_output) = serde_json::from_str::<Output>(r#"{"value":0.0}"#) {
-                    default_output
-                } else {
-                    panic!("Unable to create default Output value")
-                }
-            })
-        })
-    };
-
-    // Use the existing implementation with default functions
+    // Use the existing implementation with provided functions
     run_distributed_impl_with_code(
         move |_data: Input| -> Output {
             // Dummy function (not used) - create default output
-            if let Ok(default_output) = serde_json::from_str::<Output>(r#"{"value":0.0}"#) {
-                default_output
-            } else {
-                panic!("Unable to create default Output value in dummy function")
-            }
+            panic!("Dummy function should not be called in distributed mode")
         },
         input,
-        default_chunker,
-        default_reducer,
+        chunker,
+        reducer,
         execution_mode,
         "", // Empty function body (not used)
         map_function_name,
-    ).await
+    )
+    .await
 }

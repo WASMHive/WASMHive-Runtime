@@ -29,9 +29,6 @@ cargo run
 ## 🛠️ Project Structure
 
 ```
-├── 📁 distribute_macro/         # Procedural macros for distributed computing
-│   ├── Cargo.toml
-│   └── src/lib.rs
 ├── 📁 distribute_runtime/       # Core distributed computing runtime
 │   ├── Cargo.toml
 │   └── src/lib.rs              # WebRTC master implementation

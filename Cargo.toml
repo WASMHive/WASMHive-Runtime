@@ -1,3 +1,3 @@
 [workspace]
-members = ["distribute_macro", "distribute_runtime", "examples"]
+members = ["distribute_runtime", "examples"]
 resolver = "2"

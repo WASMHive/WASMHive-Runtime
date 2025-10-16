@@ -5,12 +5,12 @@ var<storage, read> input: array<f32>;
 var<storage, read_write> output: array<f32>;
 
 @compute @workgroup_size(64)
-fn cubeMe(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn doubleMe(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let index = global_id.x;
     if (index >= arrayLength(&input)) {
         return;
     }
 
-    // Cube each number: x * x * x (matching the CPU operation)
-    output[index] = input[index] * input[index] * input[index];
+    // Square each number: x * x (GPU computation)
+    output[index] = input[index] + input[index];
 }
