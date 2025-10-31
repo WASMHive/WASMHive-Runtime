@@ -101,7 +101,7 @@ where
 pub async fn run_distributed_impl_with_code<F, Input, Output, ChunkFn, ReduceFn>(
     _compute_fn: F,
     input: Input,
-    _chunker: ChunkFn,
+    chunker: ChunkFn,
     reducer: ReduceFn,
     execution_mode: ExecutionMode,
     _function_body: &str,
@@ -124,10 +124,54 @@ where
                 wasm_bytes.len()
             );
 
-            // Execute distributed map-reduce using compiled WASM
-            let input_json = serde_json::to_string(&input).unwrap();
-            let result = execute_distributed_map_reduce(
-                &input_json,
+            // Use provided chunker to split input into chunks consumable by the WASM module
+            let input_chunks: Vec<Input> = chunker(&input);
+
+            // Convert chunks into Vec<f32> that workers expect (best-effort extraction)
+            fn extract_numbers_from_value(value: &serde_json::Value) -> Option<Vec<f32>> {
+                if let Some(arr) = value.as_array() {
+                    let mut out = Vec::with_capacity(arr.len());
+                    for v in arr {
+                        if let Some(n) = v.as_f64() {
+                            out.push(n as f32);
+                        } else {
+                            return None;
+                        }
+                    }
+                    return Some(out);
+                }
+                if let Some(obj) = value.as_object() {
+                    if let Some(numbers) = obj.get("numbers") {
+                        return extract_numbers_from_value(numbers);
+                    }
+                }
+                None
+            }
+
+            let mut data_chunks: Vec<Vec<f32>> = Vec::new();
+            for chunk in input_chunks.iter() {
+                match serde_json::to_value(chunk) {
+                    Ok(val) => {
+                        if let Some(nums) = extract_numbers_from_value(&val) {
+                            data_chunks.push(nums);
+                        } else {
+                            println!("⚠️ Chunk could not be converted into Vec<f32>; skipping chunk: {:?}", val);
+                        }
+                    }
+                    Err(e) => {
+                        println!("⚠️ Failed to serialize chunk; skipping. Error: {}", e);
+                    }
+                }
+            }
+
+            if data_chunks.is_empty() {
+                println!("⚠️ No usable chunks produced by chunker; returning reducer on empty set");
+                return reducer(Vec::new());
+            }
+
+            // Execute distributed map using precomputed chunks and collect mapped values
+            let mapped_values_json = execute_distributed_map_reduce_with_chunks(
+                data_chunks,
                 &execution_mode,
                 &wasm_bytes,
                 &js_glue,
@@ -135,11 +179,31 @@ where
             )
             .await;
 
-            match serde_json::from_str(&result) {
-                Ok(parsed) => parsed,
+            // Parse collected mapped values (floats) and convert to Output, then apply reducer
+            match serde_json::from_str::<Vec<f32>>(&mapped_values_json) {
+                Ok(float_values) => {
+                    let mut converted: Vec<Output> = Vec::with_capacity(float_values.len());
+                    for v in float_values {
+                        // Try direct conversion from float
+                        let direct: Result<Output, _> = serde_json::from_value(serde_json::Value::from(v));
+                        if let Ok(o) = direct {
+                            converted.push(o);
+                            continue;
+                        }
+
+                        // Try common wrapper {"value": v}
+                        let wrapped = serde_json::json!({"value": v});
+                        match serde_json::from_value::<Output>(wrapped) {
+                            Ok(o) => converted.push(o),
+                            Err(_) => {
+                                println!("⚠️ Unable to convert mapped float {} into Output; skipping", v);
+                            }
+                        }
+                    }
+                    reducer(converted)
+                }
                 Err(e) => {
-                    println!("⚠️ Failed to parse distributed result: {}", e);
-                    // Return a default result based on the reducer function
+                    println!("⚠️ Failed to parse collected mapped values as floats: {}", e);
                     reducer(Vec::new())
                 }
             }
@@ -195,31 +259,37 @@ async fn compile_examples_to_wasm(
     Ok((wasm_bytes, js_glue))
 }
 
-async fn execute_distributed_map_reduce(
-    input_json: &str,
+async fn execute_distributed_map_reduce_with_chunks(
+    data_chunks: Vec<Vec<f32>>,
     execution_mode: &ExecutionMode,
     wasm_bytes: &[u8],
     js_glue: &str,
-    fn_name: &str,
+    _fn_name: &str,
 ) -> String {
-    println!("🌐 Starting distributed map-reduce execution...");
+    println!("🌐 Starting distributed map execution with precomputed chunks...");
 
     let mut distributor = match DistributedCompute::new().await {
         Ok(d) => d,
         Err(e) => {
             eprintln!("Failed to create distributed compute: {}", e);
-            return String::from("{\"value\": 0.0}");
+            return String::from("[]");
         }
     };
 
     match distributor
-        .execute_map_reduce(input_json, execution_mode, wasm_bytes, js_glue, fn_name)
+        .execute_map_with_chunks(data_chunks, execution_mode, wasm_bytes, js_glue)
         .await
     {
-        Ok(result) => result,
+        Ok(collected_values) => match serde_json::to_string(&collected_values) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to serialize collected values: {}", e);
+                String::from("[]")
+            }
+        },
         Err(e) => {
-            eprintln!("Distributed map-reduce execution failed: {}", e);
-            String::from("{\"value\": 0.0}")
+            eprintln!("Distributed map execution failed: {}", e);
+            String::from("[]")
         }
     }
 }
@@ -506,6 +576,166 @@ impl DistributedCompute {
         self.disconnect_from_signaling_server().await?;
 
         // No fallback - remote execution must work
+        Err("Failed to get results from distributed workers - remote execution required".into())
+    }
+
+    async fn execute_map_with_chunks(
+        &mut self,
+        data_chunks: Vec<Vec<f32>>,
+        execution_mode: &ExecutionMode,
+        wasm_bytes: &[u8],
+        js_glue: &str,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
+        // Connect to signaling server
+        self.connect_to_signaling_server().await?;
+        self.is_connected = true;
+
+        // Wait for initial worker discovery
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        let workers_list = {
+            let workers = self.workers.lock().await;
+            workers.clone()
+        };
+
+        println!("🔍 Current workers list: {:?}", workers_list);
+
+        if workers_list.is_empty() {
+            return Err("No workers available for computation".into());
+        }
+
+        // Wait for data channels to be established
+        println!("⏳ Waiting for data channels to be established...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+        // Filter workers to those with open data channels
+        let connected_workers = {
+            let data_channels = self.data_channels.lock().await;
+            workers_list
+                .into_iter()
+                .filter(|worker_id| data_channels.contains_key(worker_id))
+                .collect::<Vec<_>>()
+        };
+
+        if connected_workers.is_empty() {
+            return Err("No workers with data channels available for computation".into());
+        }
+
+        // Prepare tasks by round-robin assignment of chunks to workers
+        let wasm_b64 = BASE64.encode(wasm_bytes);
+        let mut tasks: Vec<(String, ComputeTask)> = Vec::new();
+        for (i, chunk) in data_chunks.into_iter().enumerate() {
+            let worker_idx = i % connected_workers.len();
+            let worker_id = connected_workers[worker_idx].clone();
+            let task = ComputeTask {
+                task_id: format!("task_{}_{}", chrono::Utc::now().timestamp_millis(), i),
+                wasm_module: wasm_b64.clone(),
+                js_glue: js_glue.to_string(),
+                data_chunk: chunk,
+                map_function: match execution_mode {
+                    ExecutionMode::CPU => "cpu_map".to_string(),
+                    ExecutionMode::GPU => "gpu_map".to_string(),
+                },
+            };
+            tasks.push((worker_id, task));
+        }
+
+        // Send tasks
+        let mut sent_tasks = 0usize;
+        println!(
+            "📊 Distributing {} chunks to {} connected workers: {:?}",
+            tasks.len(),
+            connected_workers.len(),
+            connected_workers
+        );
+
+        for (worker_id, task) in &tasks {
+            let data_channels = self.data_channels.lock().await;
+            if let Some(channel) = data_channels.get(worker_id) {
+                println!(
+                    "🔍 Attempting to send task to {}, channel state: ready",
+                    worker_id
+                );
+                let task_json = serde_json::to_string(task).unwrap();
+                match Self::send_message_chunked(channel, &task_json, &task.task_id).await {
+                    Ok(_) => {
+                        println!(
+                            "   ✅ {} -> {} ({} elements)",
+                            task.task_id,
+                            worker_id,
+                            task.data_chunk.len()
+                        );
+                        sent_tasks += 1;
+                    }
+                    Err(e) => {
+                        println!("   ❌ Failed to send to {}: {}", worker_id, e);
+                    }
+                }
+            } else {
+                println!("   ⚠️  No data channel for worker: {}", worker_id);
+            }
+        }
+
+        // Collect results
+        if sent_tasks > 0 {
+            println!("⏳ Waiting for {} results from workers...", sent_tasks);
+
+            let mut collected_results: Vec<f32> = Vec::new();
+            let timeout = tokio::time::Duration::from_secs(10);
+            let start_time = tokio::time::Instant::now();
+
+            let mut results_received = 0usize;
+            while results_received < sent_tasks && start_time.elapsed() < timeout {
+                if let Some(mut receiver) = self.result_receiver.take() {
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_millis(1000),
+                        receiver.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Some(result)) => {
+                            println!(
+                                "   📥 {} returned {} values: {:?}",
+                                result.worker_id,
+                                result.result.len(),
+                                result.result
+                            );
+                            collected_results.extend(result.result);
+                            results_received += 1;
+                        }
+                        Ok(None) => {
+                            println!("   ⚠️  Result channel closed");
+                            break;
+                        }
+                        Err(_) => {
+                            println!(
+                                "   ⏱️  Waiting for more results... ({}/{})",
+                                results_received, sent_tasks
+                            );
+                        }
+                    }
+                    self.result_receiver = Some(receiver);
+                }
+            }
+
+            if results_received == sent_tasks {
+                println!(
+                    "✅ All {} workers completed! Collected {} mapped values",
+                    sent_tasks,
+                    collected_results.len()
+                );
+                self.disconnect_from_signaling_server().await?;
+                return Ok(collected_results);
+            } else {
+                println!(
+                    "❌ Only {}/{} workers returned results - distributed execution failed",
+                    results_received, sent_tasks
+                );
+            }
+        }
+
+        // Disconnect and error
+        self.disconnect_from_signaling_server().await?;
         Err("Failed to get results from distributed workers - remote execution required".into())
     }
 
