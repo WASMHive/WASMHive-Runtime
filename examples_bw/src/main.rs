@@ -46,8 +46,8 @@ async fn extract_frames(input: &str, temp_dir: &Path, fps: u32) -> Result<(u32, 
     let width = probe_json["streams"][0]["width"].as_u64().unwrap_or(0) as u32;
     let height = probe_json["streams"][0]["height"].as_u64().unwrap_or(0) as u32;
 
-    // Extract frames as raw RGBA files: frame_000001.rgba ...
-    let pattern = temp_dir.join("frame_%06d.rgba");
+    // Extract frames as PNG files: frame_000001.png ...
+    let pattern = temp_dir.join("frame_%06d.png");
     let status = Command::new("ffmpeg")
         .args([
             "-y",
@@ -55,10 +55,6 @@ async fn extract_frames(input: &str, temp_dir: &Path, fps: u32) -> Result<(u32, 
             input,
             "-vf",
             &format!("fps={}", fps),
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgba",
             pattern.to_str().unwrap(),
         ])
         .status()
@@ -73,7 +69,7 @@ async fn extract_frames(input: &str, temp_dir: &Path, fps: u32) -> Result<(u32, 
         let entry = entry?;
         if entry.file_type().is_file() {
             let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("rgba") {
+            if p.extension().and_then(|s| s.to_str()) == Some("png") {
                 frames.push(p.to_path_buf());
             }
         }
@@ -98,7 +94,7 @@ fn chunker(job: &VideoJob) -> Vec<VideoJob> {
         .collect()
 }
 
-// 3) Encoder: read RGBA bytes and attach meta (frame_index, width, height)
+// 3) Encoder: read PNG, decode to RGBA bytes, and attach meta (frame_index, width, height)
 fn encode_chunk(chunk: &VideoJob) -> (Vec<u8>, serde_json::Value) {
     let frame_path = &chunk.frame_paths[0];
     let idx = frame_path
@@ -111,7 +107,11 @@ fn encode_chunk(chunk: &VideoJob) -> (Vec<u8>, serde_json::Value) {
         .parse::<u32>()
         .unwrap_or(0);
 
-    let bytes = std::fs::read(frame_path).unwrap_or_default();
+    // Decode PNG to RGBA bytes
+    let img = image::open(frame_path).expect("Failed to open frame PNG");
+    let rgba = img.to_rgba8();
+    let bytes = rgba.into_raw();
+
     let meta = json!({
         "frame_index": idx,
         "width": chunk.width,
@@ -120,24 +120,20 @@ fn encode_chunk(chunk: &VideoJob) -> (Vec<u8>, serde_json::Value) {
     (bytes, meta)
 }
 
-// 4) Decoder: write processed bytes back to temp dir for later re-encode, return a tuple struct
+// 4) Decoder: write processed PNG bytes back to temp dir for later re-encode
 #[derive(Clone, Serialize, Deserialize, Debug)]
 struct FrameOut { index: u32, path: PathBuf }
 
 fn decode_result(bytes: Vec<u8>, meta: serde_json::Value) -> FrameOut {
     let idx = meta["frame_index"].as_u64().unwrap_or(0) as u32;
-    let width = meta["width"].as_u64().unwrap_or(0) as u32;
-    let height = meta["height"].as_u64().unwrap_or(0) as u32;
-    // Write to temp file path based on index
     let out_dir = std::env::temp_dir().join("w3dge_bw_frames");
     std::fs::create_dir_all(&out_dir).ok();
-    let out_path = out_dir.join(format!("bw_{:06}.rgba", idx));
+    let out_path = out_dir.join(format!("bw_{:06}.png", idx));
     std::fs::write(&out_path, &bytes).ok();
-    // width/height kept in meta for encoder later
     FrameOut { index: idx, path: out_path }
 }
 
-// 5) Reducer: re-encode into MP4 via ffmpeg
+// 5) Reducer: re-encode numbered PNGs into MP4 via ffmpeg
 fn reducer(frames: Vec<FrameOut>) -> VideoResult {
     if frames.is_empty() {
         return VideoResult { output_path: String::new() };
@@ -145,41 +141,19 @@ fn reducer(frames: Vec<FrameOut>) -> VideoResult {
     let mut frames_sorted = frames;
     frames_sorted.sort_by_key(|f| f.index);
 
-    // Assume all frames same dims; derive from first meta captured in filename directory (not stored here),
-    // so we rely on re-probe of raw frame size from the job-level metadata in filenames not available now.
-    // For simplicity, ask ffmpeg to infer size via explicit -video_size using the meta we included earlier would be better,
-    // but we don't have it here; we’ll try a common fallback by reading first file size.
-    let first = &frames_sorted[0];
-    let data = std::fs::read(&first.path).unwrap();
-    // Cannot infer width/height from raw buffer size reliably; require environment variable or fallback.
-    // For demo, set environment-provided size or default (e.g., 1280x720).
-    let (width, height) = match (
-        std::env::var("W3DGE_FRAME_WIDTH").ok(),
-        std::env::var("W3DGE_FRAME_HEIGHT").ok(),
-    ) {
-        (Some(w), Some(h)) => (w.parse().unwrap_or(1280u32), h.parse().unwrap_or(720u32)),
-        _ => (1280, 720),
-    };
+    let out_video = std::env::current_dir().unwrap().join("bw_output.mp4");
 
-    let out_video = std::env::current_dir()
-        .unwrap()
-        .join("bw_output.mp4");
-
-    // Write a file list for ffmpeg concat with rawvideo is tricky; instead invoke ffmpeg with image2pipe or numbered files
-    // Our files are numbered bw_######.rgba; use pattern and fps env or default 30
     let fps = std::env::var("W3DGE_FRAME_FPS").ok().and_then(|s| s.parse().ok()).unwrap_or(30u32);
-    let pattern = first.path.parent().unwrap().join("bw_%06d.rgba");
+    let pattern = frames_sorted[0].path.parent().unwrap().join("bw_%06d.png");
 
-    // Move/copy all frames to ensure sequential numbering from 000001..N; they already are from index
-    // Encode back using ffmpeg
     let status = std::process::Command::new("ffmpeg")
         .args([
             "-y",
-            "-f", "rawvideo",
-            "-pix_fmt", "rgba",
-            "-video_size", &format!("{}x{}", width, height),
             "-framerate", &fps.to_string(),
+            "-start_number", "1",
             "-i", pattern.to_str().unwrap(),
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
             out_video.to_str().unwrap(),
         ])
         .status()
@@ -217,10 +191,10 @@ async fn main() -> Result<()> {
         frame_paths: frames,
     };
 
-    // Distribute grayscale conversion; the WASM function name is provided in examples crate
+    // Distribute grayscale conversion using JS worker function
     let result: VideoResult = run_distributed_mapreduce_bytes(
         job,
-        "grayscale_frame_rgba",
+        "grayscale_frame_js",
         chunker,
         reducer,
         encode_chunk,

@@ -663,28 +663,11 @@ impl DistributedCompute {
         // Wait for initial worker discovery
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
-        let workers_list = {
-            let workers = self.workers.lock().await;
-            workers.clone()
-        };
-
-        println!("🔍 Current workers list: {:?}", workers_list);
-
-        if workers_list.is_empty() {
-            return Err("No workers available for computation".into());
-        }
-
-        // Wait for data channels to be established
         println!("⏳ Waiting for data channels to be established...");
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-        // Filter workers to those with open data channels
         let connected_workers = {
             let data_channels = self.data_channels.lock().await;
-            workers_list
-                .into_iter()
-                .filter(|worker_id| data_channels.contains_key(worker_id))
-                .collect::<Vec<_>>()
+            data_channels.keys().cloned().collect::<Vec<_>>()
         };
 
         if connected_workers.is_empty() {
@@ -830,25 +813,11 @@ impl DistributedCompute {
         // Wait for initial worker discovery
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
-        let workers_list = {
-            let workers = self.workers.lock().await;
-            workers.clone()
-        };
-
-        if workers_list.is_empty() {
-            return Err("No workers available for computation".into());
-        }
-
-        // Wait for data channels to be established
+        // Wait for data channels to be established and use actual data channel keys
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-        // Filter workers to those with open data channels
         let connected_workers = {
             let data_channels = self.data_channels.lock().await;
-            workers_list
-                .into_iter()
-                .filter(|worker_id| data_channels.contains_key(worker_id))
-                .collect::<Vec<_>>()
+            data_channels.keys().cloned().collect::<Vec<_>>()
         };
 
         if connected_workers.is_empty() {
@@ -858,22 +827,33 @@ impl DistributedCompute {
         // Prepare tasks by round-robin
         let wasm_b64 = BASE64.encode(wasm_bytes);
         let mut tasks: Vec<(String, ComputeTaskBytes)> = Vec::new();
+        // Track first task per worker to include WASM once
+        let mut worker_first_sent: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
         for (i, (chunk_b64, meta)) in chunks_b64_with_meta.into_iter().enumerate() {
             let worker_idx = i % connected_workers.len();
             let worker_id = connected_workers[worker_idx].clone();
+            // Skip sending WASM entirely for JS map functions
+            let is_js_map = map_function_name.ends_with("_js");
+            let include_wasm = !is_js_map && !worker_first_sent.get(&worker_id).copied().unwrap_or(false);
             let task = ComputeTaskBytes {
                 task_id: format!("task_{}_{}", chrono::Utc::now().timestamp_millis(), i),
-                wasm_module: wasm_b64.clone(),
-                js_glue: js_glue.to_string(),
+                wasm_module: if include_wasm { wasm_b64.clone() } else { String::new() },
+                js_glue: if include_wasm { js_glue.to_string() } else { String::new() },
                 data_chunk_b64: chunk_b64,
                 map_function: map_function_name.to_string(),
                 meta,
             };
+            worker_first_sent.insert(worker_id.clone(), true);
             tasks.push((worker_id, task));
         }
 
         // Send tasks
         let mut sent_tasks = 0usize;
+        println!(
+            "📊 Distributing {} byte-chunks to {} connected workers",
+            tasks.len(),
+            connected_workers.len()
+        );
         for (worker_id, task) in &tasks {
             let data_channels = self.data_channels.lock().await;
             if let Some(channel) = data_channels.get(worker_id) {
