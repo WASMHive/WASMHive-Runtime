@@ -191,10 +191,10 @@ async fn main() -> Result<()> {
         frame_paths: frames,
     };
 
-    // Distribute grayscale conversion using JS worker function
+    // Distribute grayscale conversion using WASM worker function
     let result: VideoResult = run_distributed_mapreduce_bytes(
         job,
-        "grayscale_frame_js",
+        "grayscale_frame_rgba",
         chunker,
         reducer,
         encode_chunk,
