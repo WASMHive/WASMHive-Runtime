@@ -215,3 +215,23 @@ pub async fn gpu_map(input: Vec<f32>) -> Vec<f32> {
     info!("🎉 GPU computation completed! Processed {} values", result.len());
     result
 }
+
+// Byte-processing WASM function: convert an RGBA frame to grayscale in-place
+#[wasm_bindgen]
+pub fn grayscale_frame_rgba(mut input: Vec<u8>, _meta: JsValue) -> Vec<u8> {
+    let len = input.len();
+    let mut i = 0usize;
+    while i + 3 < len {
+        let r = input[i] as u16;
+        let g = input[i + 1] as u16;
+        let b = input[i + 2] as u16;
+        // Luma approximation
+        let gray = ((299 * r + 587 * g + 114 * b) / 1000) as u8;
+        input[i] = gray;
+        input[i + 1] = gray;
+        input[i + 2] = gray;
+        // alpha unchanged at i+3
+        i += 4;
+    }
+    input
+}

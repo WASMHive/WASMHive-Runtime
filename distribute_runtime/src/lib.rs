@@ -62,6 +62,18 @@ struct ComputeTask {
     map_function: String, // "cpu_map" or "gpu_map"
 }
 
+// Byte-oriented compute task (for arbitrary binary payloads like video frames)
+#[derive(Serialize, Deserialize, Debug)]
+struct ComputeTaskBytes {
+    task_id: String,
+    wasm_module: String, // base64 encoded WASM
+    js_glue: String,
+    data_chunk_b64: String, // base64-encoded bytes
+    map_function: String,   // e.g., "grayscale_frame"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta: Option<serde_json::Value>, // optional metadata (e.g., frame_index, width, height)
+}
+
 // Chunk message for large data transfers
 #[derive(Serialize, Deserialize, Debug)]
 struct ChunkMessage {
@@ -77,6 +89,14 @@ struct ComputeResult {
     task_id: String,
     result: Vec<f32>,
     worker_id: String,
+}
+
+// Variant result type to support both numeric and binary results
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(untagged)]
+enum WorkerResult {
+    Floats { task_id: String, result: Vec<f32>, worker_id: String },
+    Bytes { task_id: String, result_b64: String, worker_id: String, #[serde(default)] meta: Option<serde_json::Value> },
 }
 
 // Helper struct for parsing test data
@@ -221,13 +241,56 @@ async fn compile_examples_to_wasm(
 ) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
     println!("🔧 Compiling examples to WASM for distributed execution...");
 
-    // Get current directory and find examples path
+    // Resolve the examples directory robustly
+    use std::path::PathBuf;
     let current_dir = std::env::current_dir()?;
-    let examples_dir = if current_dir.file_name().unwrap() == "examples" {
-        current_dir
-    } else {
-        current_dir.join("examples")
-    };
+    // Allow override via env
+    if let Ok(override_dir) = std::env::var("W3DGE_WASM_EXAMPLES_DIR") {
+        let p = PathBuf::from(override_dir);
+        if p.exists() {
+            println!("📁 Using examples directory (env): {}", p.display());
+            // proceed with p
+            // Compile using wasm-pack
+            let output = Command::new("wasm-pack")
+                .args(&["build", "--target", "web", "--out-dir", "pkg"])
+                .current_dir(&p)
+                .output()?;
+            if !output.status.success() {
+                let error_msg = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("WASM compilation failed: {}", error_msg).into());
+            }
+            let wasm_file_path = p.join("pkg").join("distributed_examples_bg.wasm");
+            let js_file_path = p.join("pkg").join("distributed_examples.js");
+            let wasm_bytes = fs::read(&wasm_file_path)?;
+            let js_glue = fs::read_to_string(&js_file_path)?;
+            println!("📦 WASM module size: {} bytes", wasm_bytes.len());
+            println!("📜 JS glue size: {} bytes", js_glue.len());
+            return Ok((wasm_bytes, js_glue));
+        }
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir.parent().unwrap_or(&manifest_dir);
+
+    let candidates = [
+        current_dir.clone(),
+        current_dir.join("examples"),
+        current_dir.parent().unwrap_or(&current_dir).join("examples"),
+        repo_root.join("examples"),
+    ];
+
+    let examples_dir = candidates
+        .iter()
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("examples") && p.exists())
+        .cloned()
+        .ok_or_else(|| format!(
+            "Unable to locate examples directory. Tried: {}",
+            candidates
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))?;
 
     println!("📁 Using examples directory: {}", examples_dir.display());
 
@@ -301,8 +364,8 @@ pub struct DistributedCompute {
     workers: Arc<Mutex<Vec<String>>>,
     peer_connections: Arc<Mutex<HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>>>>,
     data_channels: Arc<Mutex<HashMap<String, Arc<RTCDataChannel>>>>,
-    result_receiver: Option<mpsc::Receiver<ComputeResult>>,
-    result_sender: mpsc::Sender<ComputeResult>,
+    result_receiver: Option<mpsc::Receiver<WorkerResult>>,
+    result_sender: mpsc::Sender<WorkerResult>,
     is_connected: bool,
     ws_sender: Option<
         Arc<
@@ -527,15 +590,22 @@ impl DistributedCompute {
                     )
                     .await
                     {
-                        Ok(Some(result)) => {
-                            println!(
-                                "   📥 {} returned {} values: {:?}",
-                                result.worker_id,
-                                result.result.len(),
-                                result.result
-                            );
-                            collected_results.extend(result.result);
-                            results_received += 1;
+                        Ok(Some(result_msg)) => {
+                            match result_msg {
+                                WorkerResult::Floats { task_id: _, result, worker_id } => {
+                                    println!(
+                                        "   📥 {} returned {} values: {:?}",
+                                        worker_id,
+                                        result.len(),
+                                        result
+                                    );
+                                    collected_results.extend(result);
+                                    results_received += 1;
+                                }
+                                WorkerResult::Bytes { task_id: _, result_b64: _, worker_id, meta: _ } => {
+                                    println!("   ⚠️ Received bytes result from {} but float results expected; ignoring", worker_id);
+                                }
+                            }
                         }
                         Ok(None) => {
                             println!("   ⚠️  Result channel closed");
@@ -693,15 +763,21 @@ impl DistributedCompute {
                     )
                     .await
                     {
-                        Ok(Some(result)) => {
-                            println!(
-                                "   📥 {} returned {} values: {:?}",
-                                result.worker_id,
-                                result.result.len(),
-                                result.result
-                            );
-                            collected_results.extend(result.result);
-                            results_received += 1;
+                        Ok(Some(result_msg)) => {
+                            match result_msg {
+                                WorkerResult::Floats { task_id: _, result, worker_id } => {
+                                    println!(
+                                        "   📥 {} returned {} values",
+                                        worker_id,
+                                        result.len()
+                                    );
+                                    collected_results.extend(result);
+                                    results_received += 1;
+                                }
+                                WorkerResult::Bytes { task_id: _, result_b64: _, worker_id, meta: _ } => {
+                                    println!("   ⚠️ Received bytes result from {} on float path; ignoring", worker_id);
+                                }
+                            }
                         }
                         Ok(None) => {
                             println!("   ⚠️  Result channel closed");
@@ -735,6 +811,116 @@ impl DistributedCompute {
         }
 
         // Disconnect and error
+        self.disconnect_from_signaling_server().await?;
+        Err("Failed to get results from distributed workers - remote execution required".into())
+    }
+
+    // Byte-based execution path for arbitrary binary chunks (e.g., video frames)
+    async fn execute_map_with_byte_chunks(
+        &mut self,
+        chunks_b64_with_meta: Vec<(String, Option<serde_json::Value>)>,
+        wasm_bytes: &[u8],
+        js_glue: &str,
+        map_function_name: &str,
+    ) -> Result<Vec<(Option<serde_json::Value>, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        // Connect to signaling server
+        self.connect_to_signaling_server().await?;
+        self.is_connected = true;
+
+        // Wait for initial worker discovery
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        let workers_list = {
+            let workers = self.workers.lock().await;
+            workers.clone()
+        };
+
+        if workers_list.is_empty() {
+            return Err("No workers available for computation".into());
+        }
+
+        // Wait for data channels to be established
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+        // Filter workers to those with open data channels
+        let connected_workers = {
+            let data_channels = self.data_channels.lock().await;
+            workers_list
+                .into_iter()
+                .filter(|worker_id| data_channels.contains_key(worker_id))
+                .collect::<Vec<_>>()
+        };
+
+        if connected_workers.is_empty() {
+            return Err("No workers with data channels available for computation".into());
+        }
+
+        // Prepare tasks by round-robin
+        let wasm_b64 = BASE64.encode(wasm_bytes);
+        let mut tasks: Vec<(String, ComputeTaskBytes)> = Vec::new();
+        for (i, (chunk_b64, meta)) in chunks_b64_with_meta.into_iter().enumerate() {
+            let worker_idx = i % connected_workers.len();
+            let worker_id = connected_workers[worker_idx].clone();
+            let task = ComputeTaskBytes {
+                task_id: format!("task_{}_{}", chrono::Utc::now().timestamp_millis(), i),
+                wasm_module: wasm_b64.clone(),
+                js_glue: js_glue.to_string(),
+                data_chunk_b64: chunk_b64,
+                map_function: map_function_name.to_string(),
+                meta,
+            };
+            tasks.push((worker_id, task));
+        }
+
+        // Send tasks
+        let mut sent_tasks = 0usize;
+        for (worker_id, task) in &tasks {
+            let data_channels = self.data_channels.lock().await;
+            if let Some(channel) = data_channels.get(worker_id) {
+                let task_json = serde_json::to_string(task).unwrap();
+                match Self::send_message_chunked(channel, &task_json, &task.task_id).await {
+                    Ok(_) => { sent_tasks += 1; }
+                    Err(e) => { println!("   ❌ Failed to send to {}: {}", worker_id, e); }
+                }
+            }
+        }
+
+        // Collect results
+        let mut collected: Vec<(Option<serde_json::Value>, String)> = Vec::new();
+        if sent_tasks > 0 {
+            let timeout = tokio::time::Duration::from_secs(60);
+            let start_time = tokio::time::Instant::now();
+            let mut results_received = 0usize;
+            while results_received < sent_tasks && start_time.elapsed() < timeout {
+                if let Some(mut receiver) = self.result_receiver.take() {
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_millis(1000),
+                        receiver.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Some(result_msg)) => {
+                            match result_msg {
+                                WorkerResult::Bytes { task_id: _, result_b64, worker_id: _, meta } => {
+                                    collected.push((meta, result_b64));
+                                    results_received += 1;
+                                }
+                                WorkerResult::Floats { .. } => {}
+                            }
+                        }
+                        Ok(None) => { break; }
+                        Err(_) => {}
+                    }
+                    self.result_receiver = Some(receiver);
+                }
+            }
+
+            if results_received == sent_tasks || (!collected.is_empty() && start_time.elapsed() >= timeout) {
+                self.disconnect_from_signaling_server().await?;
+                return Ok(collected);
+            }
+        }
+
         self.disconnect_from_signaling_server().await?;
         Err("Failed to get results from distributed workers - remote execution required".into())
     }
@@ -926,7 +1112,7 @@ impl DistributedCompute {
             Mutex<HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>>>,
         >,
         data_channels_arc: Arc<Mutex<HashMap<String, Arc<RTCDataChannel>>>>,
-        result_sender: mpsc::Sender<ComputeResult>,
+        result_sender: mpsc::Sender<WorkerResult>,
     ) {
         let worker_id_clone = worker_id.clone();
         let worker_id_clone2 = worker_id.clone();
@@ -991,7 +1177,8 @@ impl DistributedCompute {
 
                         Box::pin(async move {
                             if let Ok(text) = String::from_utf8(msg.data.to_vec()) {
-                                if let Ok(result) = serde_json::from_str::<ComputeResult>(&text) {
+                                // Try to parse as either float or bytes result
+                                if let Ok(result) = serde_json::from_str::<WorkerResult>(&text) {
                                     let _ = result_sender.send(result).await;
                                 }
                             }
@@ -1083,4 +1270,85 @@ where
         map_function_name,
     )
     .await
+}
+
+/// Byte-based distributed map-reduce that supports arbitrary user-defined Input/Output
+/// by providing chunk encoder/decoder closures and a target WASM map function name.
+pub async fn run_distributed_mapreduce_bytes<Input, ItemOutput, FinalOutput, ChunkFn, ReduceFn, ChunkEncodeFn, ResultDecodeFn>(
+    input: Input,
+    map_function_name: &str,
+    chunker: ChunkFn,
+    reducer: ReduceFn,
+    chunk_encoder: ChunkEncodeFn,
+    result_decoder: ResultDecodeFn,
+) -> FinalOutput
+where
+    Input: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+    ItemOutput: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+    FinalOutput: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+    ChunkFn: Fn(&Input) -> Vec<Input> + Send + Sync,
+    ReduceFn: Fn(Vec<ItemOutput>) -> FinalOutput + Send + Sync,
+    ChunkEncodeFn: Fn(&Input) -> (Vec<u8>, serde_json::Value) + Send + Sync,
+    ResultDecodeFn: Fn(Vec<u8>, serde_json::Value) -> ItemOutput + Send + Sync,
+{
+    println!("🌐 Running distributed byte-map with function: {}", map_function_name);
+
+    // Compile WASM from examples directory (or target dir)
+    let (wasm_bytes, js_glue) = match compile_examples_to_wasm(map_function_name).await {
+        Ok(v) => v,
+        Err(e) => {
+            println!("⚠️ WASM compilation failed: {}", e);
+            return reducer(Vec::new());
+        }
+    };
+
+    // Chunk and encode
+    let chunks = chunker(&input);
+    let mut chunks_b64_with_meta: Vec<(String, Option<serde_json::Value>)> = Vec::with_capacity(chunks.len());
+    for ch in chunks.iter() {
+        let (bytes, meta) = chunk_encoder(ch);
+        if !bytes.is_empty() {
+            chunks_b64_with_meta.push((BASE64.encode(bytes), Some(meta)));
+        }
+    }
+    if chunks_b64_with_meta.is_empty() {
+        println!("⚠️ No byte chunks produced by chunker");
+        return reducer(Vec::new());
+    }
+
+    // Execute distributed
+    let mut distributor = match DistributedCompute::new().await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to create distributed compute: {}", e);
+            return reducer(Vec::new());
+        }
+    };
+
+    let results = match distributor
+        .execute_map_with_byte_chunks(chunks_b64_with_meta, &wasm_bytes, &js_glue, map_function_name)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Distributed byte-map execution failed: {}", e);
+            return reducer(Vec::new());
+        }
+    };
+
+    // Decode to Output and reduce
+    let mut outputs: Vec<ItemOutput> = Vec::with_capacity(results.len());
+    for (meta_opt, result_b64) in results {
+        match BASE64.decode(result_b64) {
+            Ok(bytes) => {
+                let meta = meta_opt.unwrap_or(serde_json::Value::Null);
+                outputs.push(result_decoder(bytes, meta));
+            }
+            Err(e) => {
+                println!("⚠️ Failed to decode base64 result: {}", e);
+            }
+        }
+    }
+
+    reducer(outputs)
 }
