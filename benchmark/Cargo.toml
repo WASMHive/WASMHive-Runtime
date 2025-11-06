@@ -1,0 +1,18 @@
+[package]
+name = "benchmark"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "benchmark"
+path = "src/main.rs"
+
+[dependencies]
+distribute_runtime = { path = "../distribute_runtime" }
+distributed_examples = { path = "../examples" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+clap = { version = "4.0", features = ["derive"] }
+chrono = "0.4"
+
