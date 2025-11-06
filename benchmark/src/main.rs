@@ -186,7 +186,7 @@ async fn run_benchmark(
     println!("🔥 Warmup runs: {}", warmup);
     for i in 0..warmup {
         let test_data = generate_test_data(config.task_size);
-        let _ = run_single_test(&test_data, &execution_mode, i).await;
+        let _ = run_single_test(&test_data, &execution_mode, i, config.worker_count).await;
         if wait_time > 0 {
             sleep(Duration::from_secs(wait_time)).await;
         }
@@ -196,7 +196,7 @@ async fn run_benchmark(
     println!("📈 Benchmark runs: {}", iterations);
     for i in 0..iterations {
         let test_data = generate_test_data(config.task_size);
-        let result = run_single_test(&test_data, &execution_mode, i).await;
+        let result = run_single_test(&test_data, &execution_mode, i, config.worker_count).await;
         test_results.push(result);
 
         if wait_time > 0 && i < iterations - 1 {
@@ -219,6 +219,7 @@ async fn run_single_test(
     test_data: &TestData,
     execution_mode: &ExecutionMode,
     iteration: usize,
+    estimated_worker_count: usize,
 ) -> TestRunResult {
     let start = Instant::now();
     let payload_data_bytes = test_data.numbers.len() * 4; // f32 = 4 bytes per number
@@ -251,12 +252,11 @@ async fn run_single_test(
     };
 
     // Estimate total data transferred:
-    // 1. WASM module (base64 encoded) - estimate ~100KB based on typical WASM size
-    //    We can check the actual file, but for now use a reasonable estimate
+    // 1. WASM module (base64 encoded) - sent ONCE per worker (optimization)
     let estimated_wasm_bytes = estimate_wasm_size();
     let wasm_base64_bytes = (estimated_wasm_bytes as f64 * 1.33) as usize; // base64 encoding adds ~33%
     
-    // 2. JS glue code - estimate ~10KB
+    // 2. JS glue code - sent ONCE per worker (optimization)
     let estimated_js_glue_bytes = 10_000;
     
     // 3. Payload data: input chunks (JSON serialized with overhead)
@@ -269,9 +269,11 @@ async fn run_single_test(
     // 5. JSON overhead for task structure (task_id, map_function, etc.) - estimate ~500 bytes per task
     let task_metadata_bytes = 500;
     
-    // Total: WASM is sent once per worker, but for simplicity we count it per chunk
-    // In reality, WASM is only sent once, but this gives us a conservative estimate
-    let total_data_bytes = wasm_base64_bytes + estimated_js_glue_bytes + input_json_bytes + output_json_bytes + task_metadata_bytes;
+    // Total: WASM + JS sent once per worker, payload/metadata sent per task
+    let num_tasks = test_data.numbers.len(); // chunker creates one task per number
+    let wasm_overhead = (wasm_base64_bytes + estimated_js_glue_bytes) * estimated_worker_count.max(1);
+    let task_overhead = (input_json_bytes + output_json_bytes + task_metadata_bytes) * num_tasks;
+    let total_data_bytes = wasm_overhead + task_overhead;
     
     // Convert to Mbps: (bytes * 8 bits) / (seconds * 1_000_000)
     let data_throughput_mbps = if duration_secs > 0.0001 {
@@ -384,13 +386,18 @@ fn calculate_summary(results: &[TestRunResult], config: &BenchmarkConfig) -> Sum
 
     let total_tasks = config.task_size * success_count;
     // Use the same estimation logic as in run_single_test
+    // WASM is sent once per worker, not per task (optimization)
     let estimated_wasm_bytes = estimate_wasm_size();
     let wasm_base64_bytes = (estimated_wasm_bytes as f64 * 1.33) as usize;
     let estimated_js_glue_bytes = 10_000;
     let input_json_bytes = config.task_size * 8;
     let output_json_bytes = config.task_size * 8;
     let task_metadata_bytes = 500;
-    let total_data_bytes_per_run = wasm_base64_bytes + estimated_js_glue_bytes + input_json_bytes + output_json_bytes + task_metadata_bytes;
+    // WASM overhead: once per worker per run
+    let wasm_overhead_per_run = (wasm_base64_bytes + estimated_js_glue_bytes) * config.worker_count.max(1);
+    // Task overhead: per task
+    let task_overhead_per_run = (input_json_bytes + output_json_bytes + task_metadata_bytes) * config.task_size;
+    let total_data_bytes_per_run = wasm_overhead_per_run + task_overhead_per_run;
     let total_data_bytes = total_data_bytes_per_run * success_count;
 
     SummaryStats {

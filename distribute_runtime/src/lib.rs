@@ -906,19 +906,25 @@ impl DistributedCompute {
         // Prepare tasks by round-robin assignment of chunks to workers
         let wasm_b64 = BASE64.encode(wasm_bytes);
         let mut tasks: Vec<(String, ComputeTask)> = Vec::new();
+        // Track first task per worker to include WASM once (optimization)
+        let mut worker_first_sent: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
         for (i, chunk) in data_chunks.into_iter().enumerate() {
             let worker_idx = i % available_workers.len();
             let worker_id = available_workers[worker_idx].clone();
+            // Only send WASM with the first task to each worker
+            let include_wasm = !worker_first_sent.get(&worker_id).copied().unwrap_or(false);
+            let map_function = match execution_mode {
+                ExecutionMode::CPU => "cpu_map".to_string(),
+                ExecutionMode::GPU => "gpu_map".to_string(),
+            };
             let task = ComputeTask {
                 task_id: format!("task_{}_{}", chrono::Utc::now().timestamp_millis(), i),
-                wasm_module: wasm_b64.clone(),
-                js_glue: js_glue.to_string(),
+                wasm_module: if include_wasm { wasm_b64.clone() } else { String::new() },
+                js_glue: if include_wasm { js_glue.to_string() } else { String::new() },
                 data_chunk: chunk,
-                map_function: match execution_mode {
-                    ExecutionMode::CPU => "cpu_map".to_string(),
-                    ExecutionMode::GPU => "gpu_map".to_string(),
-                },
+                map_function,
             };
+            worker_first_sent.insert(worker_id.clone(), true);
             tasks.push((worker_id, task));
         }
 
