@@ -545,10 +545,12 @@ impl DistributedCompute {
 
         for (worker_id, task) in &tasks {
             let data_channels = self.data_channels.lock().await;
+            println!("🔍 Checking data channels. Total: {}, Looking for: {}", data_channels.len(), worker_id);
             if let Some(channel) = data_channels.get(worker_id) {
                 println!(
-                    "🔍 Attempting to send task to {}, channel state: ready",
-                    worker_id
+                    "🔍 Attempting to send task to {}, channel state: {:?}",
+                    worker_id,
+                    channel.ready_state()
                 );
                 let task_json = serde_json::to_string(task).unwrap();
 
@@ -1146,10 +1148,13 @@ impl DistributedCompute {
                 let data_channels_arc = data_channels_arc.clone();
 
                 Box::pin(async move {
+                    println!("📡 Master: on_data_channel fired for worker: {}", worker_id);
+                    println!("   Channel state: {:?}", data_channel.ready_state());
+                    
                     // Store the data channel
                     let mut channels = data_channels_arc.lock().await;
                     channels.insert(worker_id.clone(), data_channel.clone());
-                    println!("🔗 Connected to worker: {}", worker_id);
+                    println!("🔗 Stored data channel for worker: {} (total channels: {})", worker_id, channels.len());
 
                     // Set up message handling
                     data_channel.on_message(Box::new(move |msg| {
@@ -1158,9 +1163,17 @@ impl DistributedCompute {
                         Box::pin(async move {
                             if let Ok(text) = String::from_utf8(msg.data.to_vec()) {
                                 // Try to parse as either float or bytes result
-                                if let Ok(result) = serde_json::from_str::<WorkerResult>(&text) {
-                                    let _ = result_sender.send(result).await;
+                                match serde_json::from_str::<WorkerResult>(&text) {
+                                    Ok(result) => {
+                                        let _ = result_sender.send(result).await;
+                                    }
+                                    Err(e) => {
+                                        println!("❌ Failed to parse WorkerResult from worker message: {}", e);
+                                        println!("   Raw message: {}", text);
+                                    }
                                 }
+                            } else {
+                                println!("❌ Failed to convert message data to UTF-8 string");
                             }
                         })
                     }));
