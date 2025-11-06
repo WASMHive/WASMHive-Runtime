@@ -10,9 +10,11 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::RTCDataChannel;
+use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 #[derive(Debug, Clone)]
@@ -53,7 +55,7 @@ enum SignalingMessage {
 }
 
 // Compute task message
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct ComputeTask {
     task_id: String,
     wasm_module: String, // base64 encoded WASM
@@ -63,7 +65,7 @@ struct ComputeTask {
 }
 
 // Byte-oriented compute task (for arbitrary binary payloads like video frames)
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct ComputeTaskBytes {
     task_id: String,
     wasm_module: String, // base64 encoded WASM
@@ -97,6 +99,25 @@ struct ComputeResult {
 enum WorkerResult {
     Floats { task_id: String, result: Vec<f32>, worker_id: String },
     Bytes { task_id: String, result_b64: String, worker_id: String, #[serde(default)] meta: Option<serde_json::Value> },
+}
+
+// Task tracking for fault tolerance
+#[derive(Debug, Clone)]
+struct PendingTask {
+    task_id: String,
+    worker_id: String,
+    task: ComputeTask,
+    sent_at: std::time::Instant,
+    retry_count: u32,
+}
+
+#[derive(Debug, Clone)]
+struct PendingTaskBytes {
+    task_id: String,
+    worker_id: String,
+    task: ComputeTaskBytes,
+    sent_at: std::time::Instant,
+    retry_count: u32,
 }
 
 // Helper struct for parsing test data
@@ -379,6 +400,11 @@ pub struct DistributedCompute {
             >,
         >,
     >,
+    // Fault tolerance: track pending tasks
+    pending_tasks: Arc<Mutex<HashMap<String, PendingTask>>>,
+    pending_tasks_bytes: Arc<Mutex<HashMap<String, PendingTaskBytes>>>,
+    // Track failed workers
+    failed_workers: Arc<Mutex<HashMap<String, std::time::Instant>>>,
 }
 
 impl DistributedCompute {
@@ -395,6 +421,9 @@ impl DistributedCompute {
             result_sender,
             is_connected: false,
             ws_sender: None,
+            pending_tasks: Arc::new(Mutex::new(HashMap::new())),
+            pending_tasks_bytes: Arc::new(Mutex::new(HashMap::new())),
+            failed_workers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -453,6 +482,206 @@ impl DistributedCompute {
         }
 
         Ok(())
+    }
+
+    // Fault tolerance: Check if a worker is available and healthy
+    async fn is_worker_available(&self, worker_id: &str) -> bool {
+        let data_channels = self.data_channels.lock().await;
+        if let Some(channel) = data_channels.get(worker_id) {
+            // Check if channel is open
+            matches!(channel.ready_state(), RTCDataChannelState::Open)
+        } else {
+            false
+        }
+    }
+
+    // Fault tolerance: Get available workers (excluding failed ones)
+    async fn get_available_workers(&self) -> Vec<String> {
+        let data_channels = self.data_channels.lock().await;
+        let failed_workers = self.failed_workers.lock().await;
+        
+        data_channels
+            .iter()
+            .filter(|(worker_id, channel)| {
+                // Check if worker is not marked as failed and channel is open
+                !failed_workers.contains_key(*worker_id) &&
+                matches!(channel.ready_state(), RTCDataChannelState::Open)
+            })
+            .map(|(worker_id, _)| worker_id.clone())
+            .collect()
+    }
+
+    // Fault tolerance: Mark a worker as failed
+    async fn mark_worker_failed(&self, worker_id: &str) {
+        let mut failed_workers = self.failed_workers.lock().await;
+        failed_workers.insert(worker_id.to_string(), std::time::Instant::now());
+        println!("⚠️  Marked worker {} as failed", worker_id);
+    }
+
+    // Fault tolerance: Reassign a failed task to a new worker
+    async fn reassign_task(
+        &self,
+        pending_task: &PendingTask,
+        available_workers: &[String],
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        if available_workers.is_empty() {
+            return Err("No available workers for reassignment".into());
+        }
+
+        // Find a worker that's not the failed one
+        let new_worker = available_workers
+            .iter()
+            .find(|&w| w != &pending_task.worker_id)
+            .or_else(|| available_workers.first())
+            .ok_or("No suitable worker found")?;
+
+        let data_channels = self.data_channels.lock().await;
+        if let Some(channel) = data_channels.get(new_worker) {
+            let task_json = serde_json::to_string(&pending_task.task)?;
+            match Self::send_message_chunked(channel, &task_json, &pending_task.task.task_id).await {
+                Ok(_) => {
+                    println!(
+                        "   🔄 Reassigned task {} from {} to {} (retry {})",
+                        pending_task.task.task_id,
+                        pending_task.worker_id,
+                        new_worker,
+                        pending_task.retry_count + 1
+                    );
+                    Ok(Some(new_worker.clone()))
+                }
+                Err(e) => {
+                    println!("   ❌ Failed to reassign task to {}: {}", new_worker, e);
+                    Err(e)
+                }
+            }
+        } else {
+            Err(format!("No data channel for worker: {}", new_worker).into())
+        }
+    }
+
+    // Fault tolerance: Reassign a failed byte task to a new worker
+    async fn reassign_task_bytes(
+        &self,
+        pending_task: &PendingTaskBytes,
+        available_workers: &[String],
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        if available_workers.is_empty() {
+            return Err("No available workers for reassignment".into());
+        }
+
+        let new_worker = available_workers
+            .iter()
+            .find(|&w| w != &pending_task.worker_id)
+            .or_else(|| available_workers.first())
+            .ok_or("No suitable worker found")?;
+
+        let data_channels = self.data_channels.lock().await;
+        if let Some(channel) = data_channels.get(new_worker) {
+            let task_json = serde_json::to_string(&pending_task.task)?;
+            match Self::send_message_chunked(channel, &task_json, &pending_task.task.task_id).await {
+                Ok(_) => {
+                    println!(
+                        "   🔄 Reassigned byte task {} from {} to {} (retry {})",
+                        pending_task.task.task_id,
+                        pending_task.worker_id,
+                        new_worker,
+                        pending_task.retry_count + 1
+                    );
+                    Ok(Some(new_worker.clone()))
+                }
+                Err(e) => {
+                    println!("   ❌ Failed to reassign byte task to {}: {}", new_worker, e);
+                    Err(e)
+                }
+            }
+        } else {
+            Err(format!("No data channel for worker: {}", new_worker).into())
+        }
+    }
+
+    // Fault tolerance: Check for and reassign timed-out tasks
+    async fn check_and_reassign_timed_out_tasks(&self) {
+        const TASK_TIMEOUT_SECS: u64 = 30; // 30 seconds timeout
+        const MAX_RETRIES: u32 = 3;
+
+        let available_workers = self.get_available_workers().await;
+        if available_workers.is_empty() {
+            return;
+        }
+
+        // Check float tasks
+        let pending_tasks = self.pending_tasks.lock().await;
+        let now = std::time::Instant::now();
+        let mut to_reassign: Vec<(String, PendingTask)> = Vec::new();
+
+        for (task_id, pending_task) in pending_tasks.iter() {
+            if pending_task.retry_count >= MAX_RETRIES {
+                println!("   ⚠️  Task {} exceeded max retries, marking worker {} as failed", task_id, pending_task.worker_id);
+                self.mark_worker_failed(&pending_task.worker_id).await;
+                continue;
+            }
+
+            if now.duration_since(pending_task.sent_at).as_secs() > TASK_TIMEOUT_SECS {
+                // Check if worker is still available
+                if !self.is_worker_available(&pending_task.worker_id).await {
+                    to_reassign.push((task_id.clone(), pending_task.clone()));
+                }
+            }
+        }
+
+        drop(pending_tasks);
+
+        // Reassign timed-out tasks
+        for (task_id, mut pending_task) in to_reassign {
+            match self.reassign_task(&pending_task, &available_workers).await {
+                Ok(Some(new_worker)) => {
+                    pending_task.worker_id = new_worker;
+                    pending_task.sent_at = std::time::Instant::now();
+                    pending_task.retry_count += 1;
+                    let mut pending_tasks = self.pending_tasks.lock().await;
+                    pending_tasks.insert(task_id, pending_task);
+                }
+                Ok(None) | Err(_) => {
+                    // Mark worker as failed if reassignment fails
+                    self.mark_worker_failed(&pending_task.worker_id).await;
+                }
+            }
+        }
+
+        // Check byte tasks
+        let pending_tasks_bytes = self.pending_tasks_bytes.lock().await;
+        let mut to_reassign_bytes: Vec<(String, PendingTaskBytes)> = Vec::new();
+
+        for (task_id, pending_task) in pending_tasks_bytes.iter() {
+            if pending_task.retry_count >= MAX_RETRIES {
+                println!("   ⚠️  Byte task {} exceeded max retries, marking worker {} as failed", task_id, pending_task.worker_id);
+                self.mark_worker_failed(&pending_task.worker_id).await;
+                continue;
+            }
+
+            if now.duration_since(pending_task.sent_at).as_secs() > TASK_TIMEOUT_SECS {
+                if !self.is_worker_available(&pending_task.worker_id).await {
+                    to_reassign_bytes.push((task_id.clone(), pending_task.clone()));
+                }
+            }
+        }
+
+        drop(pending_tasks_bytes);
+
+        for (task_id, mut pending_task) in to_reassign_bytes {
+            match self.reassign_task_bytes(&pending_task, &available_workers).await {
+                Ok(Some(new_worker)) => {
+                    pending_task.worker_id = new_worker;
+                    pending_task.sent_at = std::time::Instant::now();
+                    pending_task.retry_count += 1;
+                    let mut pending_tasks_bytes = self.pending_tasks_bytes.lock().await;
+                    pending_tasks_bytes.insert(task_id, pending_task);
+                }
+                Ok(None) | Err(_) => {
+                    self.mark_worker_failed(&pending_task.worker_id).await;
+                }
+            }
+        }
     }
 
     async fn execute_map_reduce(
@@ -667,12 +896,10 @@ impl DistributedCompute {
 
         println!("⏳ Waiting for data channels to be established...");
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        let connected_workers = {
-            let data_channels = self.data_channels.lock().await;
-            data_channels.keys().cloned().collect::<Vec<_>>()
-        };
-
-        if connected_workers.is_empty() {
+        
+        // Use available workers (fault tolerance: excludes failed workers)
+        let mut available_workers = self.get_available_workers().await;
+        if available_workers.is_empty() {
             return Err("No workers with data channels available for computation".into());
         }
 
@@ -680,8 +907,8 @@ impl DistributedCompute {
         let wasm_b64 = BASE64.encode(wasm_bytes);
         let mut tasks: Vec<(String, ComputeTask)> = Vec::new();
         for (i, chunk) in data_chunks.into_iter().enumerate() {
-            let worker_idx = i % connected_workers.len();
-            let worker_id = connected_workers[worker_idx].clone();
+            let worker_idx = i % available_workers.len();
+            let worker_id = available_workers[worker_idx].clone();
             let task = ComputeTask {
                 task_id: format!("task_{}_{}", chrono::Utc::now().timestamp_millis(), i),
                 wasm_module: wasm_b64.clone(),
@@ -695,13 +922,19 @@ impl DistributedCompute {
             tasks.push((worker_id, task));
         }
 
-        // Send tasks
+        // Clear pending tasks tracking
+        {
+            let mut pending_tasks = self.pending_tasks.lock().await;
+            pending_tasks.clear();
+        }
+
+        // Send tasks and track them
         let mut sent_tasks = 0usize;
         println!(
-            "📊 Distributing {} chunks to {} connected workers: {:?}",
+            "📊 Distributing {} chunks to {} available workers: {:?}",
             tasks.len(),
-            connected_workers.len(),
-            connected_workers
+            available_workers.len(),
+            available_workers
         );
 
         for (worker_id, task) in &tasks {
@@ -720,27 +953,48 @@ impl DistributedCompute {
                             worker_id,
                             task.data_chunk.len()
                         );
+                        // Track the task for fault tolerance
+                        let pending_task = PendingTask {
+                            task_id: task.task_id.clone(),
+                            worker_id: worker_id.clone(),
+                            task: task.clone(),
+                            sent_at: std::time::Instant::now(),
+                            retry_count: 0,
+                        };
+                        let mut pending_tasks = self.pending_tasks.lock().await;
+                        pending_tasks.insert(task.task_id.clone(), pending_task);
                         sent_tasks += 1;
                     }
                     Err(e) => {
                         println!("   ❌ Failed to send to {}: {}", worker_id, e);
+                        self.mark_worker_failed(worker_id).await;
                     }
                 }
             } else {
                 println!("   ⚠️  No data channel for worker: {}", worker_id);
+                self.mark_worker_failed(worker_id).await;
             }
         }
 
-        // Collect results
+        // Collect results with fault tolerance
         if sent_tasks > 0 {
             println!("⏳ Waiting for {} results from workers...", sent_tasks);
 
             let mut collected_results: Vec<f32> = Vec::new();
-            let timeout = tokio::time::Duration::from_secs(10);
+            let timeout = tokio::time::Duration::from_secs(60); // Increased timeout for fault tolerance
             let start_time = tokio::time::Instant::now();
+            let mut last_check_time = std::time::Instant::now();
 
             let mut results_received = 0usize;
+            let mut received_task_ids = std::collections::HashSet::new();
+            
             while results_received < sent_tasks && start_time.elapsed() < timeout {
+                // Periodically check for timed-out tasks (every 5 seconds)
+                if last_check_time.elapsed().as_secs() >= 5 {
+                    self.check_and_reassign_timed_out_tasks().await;
+                    last_check_time = std::time::Instant::now();
+                }
+
                 if let Some(mut receiver) = self.result_receiver.take() {
                     match tokio::time::timeout(
                         tokio::time::Duration::from_millis(1000),
@@ -750,17 +1004,27 @@ impl DistributedCompute {
                     {
                         Ok(Some(result_msg)) => {
                             match result_msg {
-                                WorkerResult::Floats { task_id: _, result, worker_id } => {
-                                    println!(
-                                        "   📥 {} returned {} values",
-                                        worker_id,
-                                        result.len()
-                                    );
-                                    collected_results.extend(result);
-                                    results_received += 1;
+                                WorkerResult::Floats { task_id, result, worker_id } => {
+                                    // Remove from pending tasks
+                                    {
+                                        let mut pending_tasks = self.pending_tasks.lock().await;
+                                        pending_tasks.remove(&task_id);
+                                    }
+                                    
+                                    if !received_task_ids.contains(&task_id) {
+                                        println!(
+                                            "   📥 {} returned {} values for task {}",
+                                            worker_id,
+                                            result.len(),
+                                            task_id
+                                        );
+                                        collected_results.extend(result);
+                                        received_task_ids.insert(task_id);
+                                        results_received += 1;
+                                    }
                                 }
-                                WorkerResult::Bytes { task_id: _, result_b64: _, worker_id, meta: _ } => {
-                                    println!("   ⚠️ Received bytes result from {} on float path; ignoring", worker_id);
+                                WorkerResult::Bytes { task_id: _, result_b64: _, worker_id: _, meta: _ } => {
+                                    println!("   ⚠️ Received bytes result on float path; ignoring");
                                 }
                             }
                         }
@@ -769,28 +1033,40 @@ impl DistributedCompute {
                             break;
                         }
                         Err(_) => {
-                            println!(
-                                "   ⏱️  Waiting for more results... ({}/{})",
-                                results_received, sent_tasks
-                            );
+                            // Timeout - continue waiting and checking for failures
                         }
                     }
                     self.result_receiver = Some(receiver);
                 }
             }
 
-            if results_received == sent_tasks {
+            // Check if we have enough results (fault tolerance: continue with partial results)
+            let pending_count = {
+                let pending_tasks = self.pending_tasks.lock().await;
+                pending_tasks.len()
+            };
+
+            if results_received > 0 {
                 println!(
-                    "✅ All {} workers completed! Collected {} mapped values",
+                    "✅ Received {}/{} results ({} pending, {} failed workers). Collected {} mapped values",
+                    results_received,
                     sent_tasks,
+                    pending_count,
+                    self.failed_workers.lock().await.len(),
                     collected_results.len()
                 );
-                self.disconnect_from_signaling_server().await?;
-                return Ok(collected_results);
-            } else {
+                
+                // If we have some results, return them (fault tolerance)
+                if !collected_results.is_empty() {
+                    self.disconnect_from_signaling_server().await?;
+                    return Ok(collected_results);
+                }
+            }
+
+            if pending_count > 0 && available_workers.is_empty() {
                 println!(
-                    "❌ Only {}/{} workers returned results - distributed execution failed",
-                    results_received, sent_tasks
+                    "❌ No available workers remaining. {} tasks still pending",
+                    pending_count
                 );
             }
         }
@@ -817,12 +1093,10 @@ impl DistributedCompute {
 
         // Wait for data channels to be established and use actual data channel keys
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        let connected_workers = {
-            let data_channels = self.data_channels.lock().await;
-            data_channels.keys().cloned().collect::<Vec<_>>()
-        };
-
-        if connected_workers.is_empty() {
+        
+        // Use available workers (fault tolerance: excludes failed workers)
+        let mut available_workers = self.get_available_workers().await;
+        if available_workers.is_empty() {
             return Err("No workers with data channels available for computation".into());
         }
 
@@ -832,8 +1106,8 @@ impl DistributedCompute {
         // Track first task per worker to include WASM once
         let mut worker_first_sent: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
         for (i, (chunk_b64, meta)) in chunks_b64_with_meta.into_iter().enumerate() {
-            let worker_idx = i % connected_workers.len();
-            let worker_id = connected_workers[worker_idx].clone();
+            let worker_idx = i % available_workers.len();
+            let worker_id = available_workers[worker_idx].clone();
             // Skip sending WASM entirely for JS map functions
             let is_js_map = map_function_name.ends_with("_js");
             let include_wasm = !is_js_map && !worker_first_sent.get(&worker_id).copied().unwrap_or(false);
@@ -849,31 +1123,64 @@ impl DistributedCompute {
             tasks.push((worker_id, task));
         }
 
-        // Send tasks
+        // Clear pending tasks tracking
+        {
+            let mut pending_tasks_bytes = self.pending_tasks_bytes.lock().await;
+            pending_tasks_bytes.clear();
+        }
+
+        // Send tasks and track them
         let mut sent_tasks = 0usize;
         println!(
-            "📊 Distributing {} byte-chunks to {} connected workers",
+            "📊 Distributing {} byte-chunks to {} available workers",
             tasks.len(),
-            connected_workers.len()
+            available_workers.len()
         );
         for (worker_id, task) in &tasks {
             let data_channels = self.data_channels.lock().await;
             if let Some(channel) = data_channels.get(worker_id) {
                 let task_json = serde_json::to_string(task).unwrap();
                 match Self::send_message_chunked(channel, &task_json, &task.task_id).await {
-                    Ok(_) => { sent_tasks += 1; }
-                    Err(e) => { println!("   ❌ Failed to send to {}: {}", worker_id, e); }
+                    Ok(_) => {
+                        // Track the task for fault tolerance
+                        let pending_task = PendingTaskBytes {
+                            task_id: task.task_id.clone(),
+                            worker_id: worker_id.clone(),
+                            task: task.clone(),
+                            sent_at: std::time::Instant::now(),
+                            retry_count: 0,
+                        };
+                        let mut pending_tasks_bytes = self.pending_tasks_bytes.lock().await;
+                        pending_tasks_bytes.insert(task.task_id.clone(), pending_task);
+                        sent_tasks += 1;
+                    }
+                    Err(e) => {
+                        println!("   ❌ Failed to send to {}: {}", worker_id, e);
+                        self.mark_worker_failed(worker_id).await;
+                    }
                 }
+            } else {
+                println!("   ⚠️  No data channel for worker: {}", worker_id);
+                self.mark_worker_failed(worker_id).await;
             }
         }
 
-        // Collect results
+        // Collect results with fault tolerance
         let mut collected: Vec<(Option<serde_json::Value>, String)> = Vec::new();
         if sent_tasks > 0 {
             let timeout = tokio::time::Duration::from_secs(60);
             let start_time = tokio::time::Instant::now();
+            let mut last_check_time = std::time::Instant::now();
             let mut results_received = 0usize;
+            let mut received_task_ids = std::collections::HashSet::new();
+            
             while results_received < sent_tasks && start_time.elapsed() < timeout {
+                // Periodically check for timed-out tasks (every 5 seconds)
+                if last_check_time.elapsed().as_secs() >= 5 {
+                    self.check_and_reassign_timed_out_tasks().await;
+                    last_check_time = std::time::Instant::now();
+                }
+
                 if let Some(mut receiver) = self.result_receiver.take() {
                     match tokio::time::timeout(
                         tokio::time::Duration::from_millis(1000),
@@ -883,9 +1190,18 @@ impl DistributedCompute {
                     {
                         Ok(Some(result_msg)) => {
                             match result_msg {
-                                WorkerResult::Bytes { task_id: _, result_b64, worker_id: _, meta } => {
-                                    collected.push((meta, result_b64));
-                                    results_received += 1;
+                                WorkerResult::Bytes { task_id, result_b64, worker_id: _, meta } => {
+                                    // Remove from pending tasks
+                                    {
+                                        let mut pending_tasks_bytes = self.pending_tasks_bytes.lock().await;
+                                        pending_tasks_bytes.remove(&task_id);
+                                    }
+                                    
+                                    if !received_task_ids.contains(&task_id) {
+                                        collected.push((meta, result_b64));
+                                        received_task_ids.insert(task_id);
+                                        results_received += 1;
+                                    }
                                 }
                                 WorkerResult::Floats { .. } => {}
                             }
@@ -897,7 +1213,20 @@ impl DistributedCompute {
                 }
             }
 
-            if results_received == sent_tasks || (!collected.is_empty() && start_time.elapsed() >= timeout) {
+            // Check if we have enough results (fault tolerance: continue with partial results)
+            let pending_count = {
+                let pending_tasks_bytes = self.pending_tasks_bytes.lock().await;
+                pending_tasks_bytes.len()
+            };
+
+            if results_received > 0 || (!collected.is_empty() && start_time.elapsed() >= timeout) {
+                println!(
+                    "✅ Received {}/{} byte results ({} pending, {} failed workers)",
+                    results_received,
+                    sent_tasks,
+                    pending_count,
+                    self.failed_workers.lock().await.len()
+                );
                 self.disconnect_from_signaling_server().await?;
                 return Ok(collected);
             }
@@ -955,6 +1284,7 @@ impl DistributedCompute {
         let peer_connections_arc = self.peer_connections.clone();
         let data_channels_arc = self.data_channels.clone();
         let result_sender = self.result_sender.clone();
+        let failed_workers_arc = self.failed_workers.clone();
 
         tokio::spawn(async move {
             while let Some(msg) = ws_receiver.next().await {
@@ -1015,6 +1345,7 @@ impl DistributedCompute {
                                                     peer_connections_arc.clone(),
                                                     data_channels_arc.clone(),
                                                     result_sender.clone(),
+                                                    failed_workers_arc.clone(),
                                                 )
                                                 .await;
                                             }
@@ -1095,6 +1426,7 @@ impl DistributedCompute {
         >,
         data_channels_arc: Arc<Mutex<HashMap<String, Arc<RTCDataChannel>>>>,
         result_sender: mpsc::Sender<WorkerResult>,
+        failed_workers_arc: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     ) {
         let worker_id_clone = worker_id.clone();
         let worker_id_clone2 = worker_id.clone();
@@ -1112,6 +1444,30 @@ impl DistributedCompute {
         let api = APIBuilder::new().build();
         if let Ok(peer_connection) = api.new_peer_connection(config).await {
             let pc = Arc::new(peer_connection);
+
+            // Fault tolerance: Monitor connection state changes
+            let worker_id_for_state = worker_id.clone();
+            let failed_workers_arc_clone = failed_workers_arc.clone();
+            pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+                let worker_id = worker_id_for_state.clone();
+                let failed_workers = failed_workers_arc_clone.clone();
+                println!("🔍 Connection state changed for worker {}: {:?}", worker_id, s);
+                
+                // Mark worker as failed if connection is closed/failed/disconnected
+                if matches!(s, 
+                    RTCPeerConnectionState::Closed |
+                    RTCPeerConnectionState::Failed |
+                    RTCPeerConnectionState::Disconnected
+                ) {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.spawn(async move {
+                        let mut failed_workers = failed_workers.lock().await;
+                        failed_workers.insert(worker_id.clone(), std::time::Instant::now());
+                        println!("⚠️  Worker {} connection lost, marked as failed", worker_id);
+                    });
+                }
+                Box::pin(async {})
+            }));
 
             // Set up ICE candidate handling
             let ws_sender_clone = ws_sender.clone();
@@ -1155,6 +1511,10 @@ impl DistributedCompute {
                     let mut channels = data_channels_arc.lock().await;
                     channels.insert(worker_id.clone(), data_channel.clone());
                     println!("🔗 Stored data channel for worker: {} (total channels: {})", worker_id, channels.len());
+
+                    // Fault tolerance: Monitor data channel state changes
+                    // Note: We monitor the connection state instead since on_close may not be available
+                    // The connection state change handler above will catch channel closures
 
                     // Set up message handling
                     data_channel.on_message(Box::new(move |msg| {
