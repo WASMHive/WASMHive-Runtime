@@ -1174,13 +1174,56 @@ impl DistributedCompute {
         // Collect results with fault tolerance
         let mut collected: Vec<(Option<serde_json::Value>, String)> = Vec::new();
         if sent_tasks > 0 {
-            let timeout = tokio::time::Duration::from_secs(60);
+            // Dynamic timeout: base 60s + 10s per task (minimum 60s, maximum 600s)
+            let base_timeout = 60usize;
+            let per_task_timeout = 10usize;
+            let calculated_timeout = base_timeout + (sent_tasks * per_task_timeout);
+            let timeout_secs = calculated_timeout.min(600).max(60); // Cap at 10 minutes, minimum 1 minute
+            let timeout = tokio::time::Duration::from_secs(timeout_secs as u64);
+            println!("⏱️  Timeout set to {} seconds for {} tasks", timeout_secs, sent_tasks);
+            
             let start_time = tokio::time::Instant::now();
             let mut last_check_time = std::time::Instant::now();
             let mut results_received = 0usize;
             let mut received_task_ids = std::collections::HashSet::new();
+            let mut consecutive_timeouts = 0usize;
+            const MAX_CONSECUTIVE_TIMEOUTS: usize = 30; // Stop after 30 seconds of no activity
+            let mut current_timeout = timeout;
+            let mut timeout_extended = false;
             
-            while results_received < sent_tasks && start_time.elapsed() < timeout {
+            loop {
+                // Check if we've received all results
+                if results_received >= sent_tasks {
+                    break;
+                }
+                
+                // Check if we've exceeded the timeout
+                let elapsed = start_time.elapsed();
+                if elapsed >= current_timeout {
+                    // Check if there are still pending tasks and available workers
+                    let pending_count = {
+                        let pending_tasks_bytes = self.pending_tasks_bytes.lock().await;
+                        pending_tasks_bytes.len()
+                    };
+                    let available_workers_count = self.get_available_workers().await.len();
+                    
+                    if pending_count > 0 && available_workers_count > 0 && !timeout_extended {
+                        // Still have pending tasks and workers - extend timeout and continue
+                        println!("⏳ Timeout reached but {} tasks still pending with {} available workers. Extending timeout by 60s...", pending_count, available_workers_count);
+                        current_timeout = current_timeout + tokio::time::Duration::from_secs(60);
+                        timeout_extended = true;
+                        // Continue waiting with extended timeout (don't break)
+                    } else {
+                        // Extended timeout also reached or no pending tasks/workers
+                        if pending_count > 0 {
+                            println!("⚠️  Timeout reached. {} tasks still pending. Stopping with partial results.", pending_count);
+                        } else {
+                            println!("⏱️  Timeout reached. No pending tasks.");
+                        }
+                        break;
+                    }
+                }
+                
                 // Periodically check for timed-out tasks (every 5 seconds)
                 if last_check_time.elapsed().as_secs() >= 5 {
                     self.check_and_reassign_timed_out_tasks().await;
@@ -1195,6 +1238,7 @@ impl DistributedCompute {
                     .await
                     {
                         Ok(Some(result_msg)) => {
+                            consecutive_timeouts = 0; // Reset timeout counter on successful receive
                             match result_msg {
                                 WorkerResult::Bytes { task_id, result_b64, worker_id: _, meta } => {
                                     // Remove from pending tasks
@@ -1207,15 +1251,31 @@ impl DistributedCompute {
                                         collected.push((meta, result_b64));
                                         received_task_ids.insert(task_id);
                                         results_received += 1;
+                                        if results_received % 10 == 0 {
+                                            println!("   📊 Progress: {}/{} results received", results_received, sent_tasks);
+                                        }
                                     }
                                 }
                                 WorkerResult::Floats { .. } => {}
                             }
                         }
-                        Ok(None) => { break; }
-                        Err(_) => {}
+                        Ok(None) => { 
+                            println!("   ⚠️  Result channel closed");
+                            break; 
+                        }
+                        Err(_) => {
+                            // Timeout on receive - increment counter
+                            consecutive_timeouts += 1;
+                            if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
+                                println!("   ⚠️  No results received for {} seconds. Stopping wait loop.", MAX_CONSECUTIVE_TIMEOUTS);
+                                break;
+                            }
+                        }
                     }
                     self.result_receiver = Some(receiver);
+                } else {
+                    // No receiver available - wait a bit and retry
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
 
@@ -1225,7 +1285,7 @@ impl DistributedCompute {
                 pending_tasks_bytes.len()
             };
 
-            if results_received > 0 || (!collected.is_empty() && start_time.elapsed() >= timeout) {
+            if results_received > 0 || !collected.is_empty() {
                 println!(
                     "✅ Received {}/{} byte results ({} pending, {} failed workers)",
                     results_received,

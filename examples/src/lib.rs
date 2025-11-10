@@ -235,3 +235,179 @@ pub fn grayscale_frame_rgba(mut input: Vec<u8>, _meta: JsValue) -> Vec<u8> {
     }
     input
 }
+
+// WASM function to fetch multiple URLs and extract their titles
+#[wasm_bindgen]
+pub async fn fetch_url_title(url_bytes: Vec<u8>, _meta: JsValue) -> Vec<u8> {
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::{Request, RequestInit, RequestMode, Response};
+    use log::info;
+    console_log::init_with_level(log::Level::Info).ok();
+
+    // Parse JSON array of URLs
+    let urls_json = match String::from_utf8(url_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            info!("⚠️ Failed to decode URL bytes");
+            return b"[]".to_vec();
+        }
+    };
+
+    let urls: Vec<String> = match serde_json::from_str(&urls_json) {
+        Ok(urls) => urls,
+        Err(e) => {
+            info!("⚠️ Failed to parse URLs JSON: {:?}", e);
+            return b"[]".to_vec();
+        }
+    };
+
+    let url_count = urls.len();
+    info!("🌐 Fetching batch of {} URLs", url_count);
+
+    // Fetch all URLs in parallel using futures
+    #[derive(serde::Serialize)]
+    struct UrlTitleResult {
+        url: String,
+        title: String,
+    }
+    
+    // Create futures for all URL fetches - fetch in parallel
+    use futures::future;
+    let fetch_futures: Vec<_> = urls.iter().enumerate().map(|(idx, url_str)| {
+        let url = url_str.clone();
+        async move {
+            info!("   🔄 [{}/{}] Starting fetch: {}", idx + 1, url_count, url);
+            let title = match fetch_single_url(&url).await {
+                Ok(t) => {
+                    info!("   ✅ [{}/{}] Success: {} -> {}", idx + 1, url_count, url, t);
+                    t
+                }
+                Err(e) => {
+                    info!("   ⚠️ [{}/{}] Error: {} -> {}", idx + 1, url_count, url, e);
+                    format!("ERROR: {}", e)
+                }
+            };
+            UrlTitleResult {
+                url,
+                title,
+            }
+        }
+    }).collect();
+    
+    info!("   ⏳ Awaiting {} parallel fetches...", fetch_futures.len());
+    
+    // Execute all fetches in parallel
+    let results: Vec<UrlTitleResult> = future::join_all(fetch_futures).await;
+
+    // Convert results to JSON array
+    let results_json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
+    info!("✅ Completed batch: {} URLs processed", results.len());
+    
+    results_json.into_bytes()
+}
+
+// Helper function to URL encode (simple implementation)
+fn url_encode(s: &str) -> String {
+    let mut encoded = String::new();
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push_str(&format!("{:02X}", byte));
+            }
+        }
+    }
+    encoded
+}
+
+// Helper function to fetch a single URL and extract its title
+async fn fetch_single_url(url_str: &str) -> Result<String, String> {
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::{Request, RequestInit, RequestMode, Response};
+    use log::info;
+
+    // Use local CORS proxy to bypass browser CORS restrictions
+    // Make sure proxy-server.js is running on port 3001
+    let encoded_url = url_encode(url_str);
+    let fetch_url = format!("http://localhost:3001/proxy?url={}", encoded_url);
+    
+    // Create a fetch request
+    let mut opts = RequestInit::new();
+    opts.method("GET");
+    opts.mode(RequestMode::Cors);
+
+    let request = Request::new_with_str_and_init(&fetch_url, &opts)
+        .map_err(|e| format!("Failed to create request: {:?}", e))?;
+
+    // Fetch the URL
+    let window = web_sys::window().expect("no global `window` exists");
+    let fetch_promise = window.fetch_with_request(&request);
+    
+    // Handle fetch errors (likely CORS)
+    let response = match JsFuture::from(fetch_promise).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            // Check if it's a CORS error
+            let error_msg = format!("{:?}", e);
+            if error_msg.contains("Failed to fetch") || error_msg.contains("CORS") {
+                return Err(format!("CORS blocked: Browser security prevents fetching this URL. Consider using a CORS proxy or server-side fetching."));
+            }
+            return Err(format!("Fetch failed: {:?}", e));
+        }
+    };
+    
+    let resp: Response = response.dyn_into().unwrap();
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+
+    // Get the response text
+    let text_promise = resp.text().unwrap();
+    let text = JsFuture::from(text_promise).await
+        .map_err(|e| format!("Failed to read response: {:?}", e))?;
+    
+    let text_str: String = text.as_string().unwrap_or_default();
+
+    // Extract title from HTML
+    let title = extract_title_from_html(&text_str);
+    Ok(title)
+}
+
+// Helper function to extract title from HTML
+fn extract_title_from_html(html: &str) -> String {
+    // Look for <title> tag (case-insensitive)
+    let html_lower = html.to_lowercase();
+    
+    // Find <title> tag
+    if let Some(title_start) = html_lower.find("<title>") {
+        let title_content_start = title_start + 7; // length of "<title>"
+        if let Some(title_end) = html[title_content_start..].find("</title>") {
+            let title = html[title_content_start..title_content_start + title_end].trim();
+            // Decode HTML entities if needed (basic handling)
+            let title = title
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&nbsp;", " ");
+            return title.to_string();
+        }
+    }
+    
+    // Fallback: try to find title in meta tags
+    if let Some(meta_start) = html_lower.find("property=\"og:title\"") {
+        if let Some(content_start) = html[meta_start..].find("content=\"") {
+            let content_start = meta_start + content_start + 9; // length of "content=\""
+            if let Some(content_end) = html[content_start..].find("\"") {
+                let title = html[content_start..content_start + content_end].trim();
+                return title.to_string();
+            }
+        }
+    }
+    
+    "NO TITLE FOUND".to_string()
+}
