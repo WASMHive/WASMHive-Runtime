@@ -1011,22 +1011,69 @@ impl DistributedCompute {
                         Ok(Some(result_msg)) => {
                             match result_msg {
                                 WorkerResult::Floats { task_id, result, worker_id } => {
-                                    // Remove from pending tasks
-                                    {
-                                        let mut pending_tasks = self.pending_tasks.lock().await;
-                                        pending_tasks.remove(&task_id);
-                                    }
-                                    
-                                    if !received_task_ids.contains(&task_id) {
+                                    // If the worker returned an empty result, treat this as a failure
+                                    // and attempt to reassign the task instead of counting it as success.
+                                    if result.is_empty() {
                                         println!(
-                                            "   📥 {} returned {} values for task {}",
+                                            "   ⚠️ {} returned 0 values for task {}; treating as failure and attempting reassignment",
                                             worker_id,
-                                            result.len(),
                                             task_id
                                         );
-                                        collected_results.extend(result);
-                                        received_task_ids.insert(task_id);
-                                        results_received += 1;
+
+                                        // Take the pending task (if it still exists) so we can reassign it.
+                                        let pending_task_opt = {
+                                            let mut pending_tasks = self.pending_tasks.lock().await;
+                                            pending_tasks.remove(&task_id)
+                                        };
+
+                                        if let Some(mut pending_task) = pending_task_opt {
+                                            // Mark this worker as failed so it won't be selected again.
+                                            self.mark_worker_failed(&worker_id).await;
+
+                                            // Try to reassign to another available worker immediately.
+                                            let available_workers = self.get_available_workers().await;
+                                            match self.reassign_task(&pending_task, &available_workers).await {
+                                                Ok(Some(new_worker)) => {
+                                                    // Update tracking for the reassigned task.
+                                                    pending_task.worker_id = new_worker;
+                                                    pending_task.sent_at = std::time::Instant::now();
+                                                    pending_task.retry_count += 1;
+                                                    let mut pending_tasks = self.pending_tasks.lock().await;
+                                                    pending_tasks.insert(task_id.clone(), pending_task);
+                                                }
+                                                Ok(None) | Err(_) => {
+                                                    // If we couldn't reassign, keep the task pending so that
+                                                    // the timeout-based fault tolerance can handle it later.
+                                                    let mut pending_tasks = self.pending_tasks.lock().await;
+                                                    pending_tasks.insert(task_id.clone(), pending_task);
+                                                }
+                                            }
+                                        } else {
+                                            println!(
+                                                "   ⚠️ Received empty result for unknown or already completed task {}",
+                                                task_id
+                                            );
+                                        }
+
+                                        // Do NOT increment results_received or add to collected_results here.
+                                    } else {
+                                        // Successful result path: remove from pending and aggregate values.
+                                        {
+                                            let mut pending_tasks = self.pending_tasks.lock().await;
+                                            pending_tasks.remove(&task_id);
+                                        }
+
+                                        if !received_task_ids.contains(&task_id) {
+                                            println!(
+                                                "   📥 {} returned {} values for task {}",
+                                                worker_id,
+                                                result.len(),
+                                                task_id
+                                            );
+                                            collected_results.extend(result);
+                                            received_task_ids.insert(task_id);
+                                            results_received += 1;
+                                        }
                                     }
                                 }
                                 WorkerResult::Bytes { task_id: _, result_b64: _, worker_id: _, meta: _ } => {
