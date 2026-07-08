@@ -1,0 +1,98 @@
+[
+  {
+    "timestamp": "2025-11-18T16:37:56.292134+00:00",
+    "config": {
+      "worker_count": 8,
+      "task_size": 100,
+      "execution_mode": "cpu",
+      "iterations": 1
+    },
+    "results": [
+      {
+        "iteration": 0,
+        "duration_ms": 10177.148875,
+        "tasks_per_second": 9.82593467269093,
+        "data_throughput_mbps": 1.9076777040858608,
+        "latency_ms": 10177.148875,
+        "success": true,
+        "error": null
+      }
+    ],
+    "summary": {
+      "mean_duration_ms": 10177.148875,
+      "stddev_duration_ms": 0.0,
+      "mean_tasks_per_second": 9.82593467269093,
+      "mean_data_throughput_mbps": 1.9076777040858608,
+      "mean_latency_ms": 10177.148875,
+      "min_latency_ms": 10177.148875,
+      "max_latency_ms": 10177.148875,
+      "success_rate": 1.0,
+      "total_tasks": 100,
+      "total_data_bytes": 2426840
+    }
+  },
+  {
+    "timestamp": "2025-11-18T16:38:09.025048+00:00",
+    "config": {
+      "worker_count": 8,
+      "task_size": 1000,
+      "execution_mode": "cpu",
+      "iterations": 1
+    },
+    "results": [
+      {
+        "iteration": 0,
+        "duration_ms": 10731.071375,
+        "tasks_per_second": 93.18734029946755,
+        "data_throughput_mbps": 13.953380307285487,
+        "latency_ms": 10731.071375,
+        "success": true,
+        "error": null
+      }
+    ],
+    "summary": {
+      "mean_duration_ms": 10731.071375,
+      "stddev_duration_ms": 0.0,
+      "mean_tasks_per_second": 93.18734029946755,
+      "mean_data_throughput_mbps": 13.953380307285487,
+      "mean_latency_ms": 10731.071375,
+      "min_latency_ms": 10731.071375,
+      "max_latency_ms": 10731.071375,
+      "success_rate": 1.0,
+      "total_tasks": 1000,
+      "total_data_bytes": 18716840
+    }
+  },
+  {
+    "timestamp": "2025-11-18T16:38:28.515851+00:00",
+    "config": {
+      "worker_count": 8,
+      "task_size": 10000,
+      "execution_mode": "cpu",
+      "iterations": 1
+    },
+    "results": [
+      {
+        "iteration": 0,
+        "duration_ms": 17487.98725,
+        "tasks_per_second": 571.8210939340661,
+        "data_throughput_mbps": 735.2323933104423,
+        "latency_ms": 17487.98725,
+        "success": true,
+        "error": null
+      }
+    ],
+    "summary": {
+      "mean_duration_ms": 17487.98725,
+      "stddev_duration_ms": 0.0,
+      "mean_tasks_per_second": 571.8210939340661,
+      "mean_data_throughput_mbps": 735.2323933104423,
+      "mean_latency_ms": 17487.98725,
+      "min_latency_ms": 17487.98725,
+      "max_latency_ms": 17487.98725,
+      "success_rate": 1.0,
+      "total_tasks": 10000,
+      "total_data_bytes": 1607216840
+    }
+  }
+]
