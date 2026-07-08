@@ -9,23 +9,23 @@ use tokio::time::sleep;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Number of workers to test with (comma-separated list)
-    #[arg(long, default_value = "1,2,4")]
+    #[arg(long, default_value = "1")]
     workers: String,
 
     /// Task sizes to test (comma-separated list of number of elements)
-    #[arg(long, default_value = "100,1000,10000")]
+    #[arg(long, default_value = "100,1000")]
     task_sizes: String,
 
     /// Execution mode: cpu, gpu, or both
-    #[arg(long, default_value = "both")]
+    #[arg(long, default_value = "cpu")]
     mode: String,
 
     /// Number of iterations per test
-    #[arg(long, default_value = "5")]
+    #[arg(long, default_value = "1")]
     iterations: usize,
 
     /// Warmup iterations before benchmarking
-    #[arg(long, default_value = "2")]
+    #[arg(long, default_value = "0")]
     warmup: usize,
 
     /// Output file for results (JSON format)
