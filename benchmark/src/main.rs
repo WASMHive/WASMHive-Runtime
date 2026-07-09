@@ -240,8 +240,11 @@ async fn run_single_test(
     let duration_ms = duration.as_secs_f64() * 1000.0;
     let duration_secs = duration.as_secs_f64();
 
-    let success = result.value.is_finite();
-    let error = if success { None } else { Some("Invalid result".to_string()) };
+    let (success, error) = match &result {
+        Ok(r) if r.value.is_finite() => (true, None),
+        Ok(_) => (false, Some("Invalid result".to_string())),
+        Err(e) => (false, Some(e.to_string())),
+    };
 
     // Calculate throughput metrics
     let num_chunks = test_data.numbers.len(); // chunker creates one chunk per number
@@ -251,28 +254,23 @@ async fn run_single_test(
         0.0
     };
 
-    // Estimate total data transferred:
-    // 1. WASM module (base64 encoded) - sent ONCE per worker (optimization)
+    // Estimate total data transferred over the binary protocol:
+    // 1. WASM module + JS glue - sent as raw bytes ONCE per worker
     let estimated_wasm_bytes = estimate_wasm_size();
-    let wasm_base64_bytes = (estimated_wasm_bytes as f64 * 1.33) as usize; // base64 encoding adds ~33%
-    
-    // 2. JS glue code - sent ONCE per worker (optimization)
     let estimated_js_glue_bytes = 10_000;
-    
-    // 3. Payload data: input chunks (JSON serialized with overhead)
-    //    Each f32 in JSON is ~6-8 bytes (number + comma/whitespace), use 8 bytes as estimate
-    let input_json_bytes = test_data.numbers.len() * 8;
-    
-    // 4. Output data: results (JSON serialized)
-    let output_json_bytes = test_data.numbers.len() * 8; // assuming same size output
-    
-    // 5. JSON overhead for task structure (task_id, map_function, etc.) - estimate ~500 bytes per task
-    let task_metadata_bytes = 500;
-    
-    // Total: WASM + JS sent once per worker, payload/metadata sent per task
+
+    // 2. Payload data: each f32 travels as 4 raw little-endian bytes, in and out
+    let input_bytes = test_data.numbers.len() * 4;
+    let output_bytes = test_data.numbers.len() * 4;
+
+    // 3. Per-task framing overhead (frame header + JSON task/result headers)
+    let task_metadata_bytes = 250;
+
+    // Total: WASM + glue once per worker, payload/framing per task
     let num_tasks = test_data.numbers.len(); // chunker creates one task per number
-    let wasm_overhead = (wasm_base64_bytes + estimated_js_glue_bytes) * estimated_worker_count.max(1);
-    let task_overhead = (input_json_bytes + output_json_bytes + task_metadata_bytes) * num_tasks;
+    let wasm_overhead =
+        (estimated_wasm_bytes + estimated_js_glue_bytes) * estimated_worker_count.max(1);
+    let task_overhead = (input_bytes + output_bytes) + task_metadata_bytes * num_tasks;
     let total_data_bytes = wasm_overhead + task_overhead;
     
     // Convert to Mbps: (bytes * 8 bits) / (seconds * 1_000_000)
