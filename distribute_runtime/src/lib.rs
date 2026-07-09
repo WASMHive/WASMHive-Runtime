@@ -1,7 +1,8 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::process::Command;
 use std::sync::Arc;
@@ -19,8 +20,9 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 pub mod protocol;
 use protocol::{
-    decode_frame, decode_result_payload, encode_task_payload, split_into_frames, Reassembler,
-    TaskHeader, FRAME_RESULT, FRAME_TASK,
+    decode_frame, decode_result_payload, encode_module_payload, encode_task_payload,
+    split_into_frames, Reassembler, TaskHeader, FRAME_CONTROL, FRAME_MODULE, FRAME_RESULT,
+    FRAME_TASK,
 };
 
 pub type DistributeError = Box<dyn std::error::Error + Send + Sync>;
@@ -40,13 +42,89 @@ pub enum MissingChunkPolicy {
     AllowPartial,
 }
 
+/// Where the WASM module a job ships to workers comes from.
+#[derive(Clone)]
+pub enum ModuleSource {
+    /// Compile the workspace `examples` crate with wasm-pack (the historical default).
+    CompileExamplesCrate,
+    /// Load a prebuilt wasm-pack `pkg/` directory (any crate, no framework changes).
+    PkgDir(std::path::PathBuf),
+    /// Bytes supplied directly by the caller.
+    Prebuilt { wasm: Vec<u8>, glue: String },
+}
+
+impl std::fmt::Debug for ModuleSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModuleSource::CompileExamplesCrate => write!(f, "CompileExamplesCrate"),
+            ModuleSource::PkgDir(p) => write!(f, "PkgDir({})", p.display()),
+            ModuleSource::Prebuilt { wasm, glue } => {
+                write!(f, "Prebuilt {{ wasm: {}B, glue: {}B }}", wasm.len(), glue.len())
+            }
+        }
+    }
+}
+
+impl ModuleSource {
+    async fn resolve(&self) -> Result<(Vec<u8>, String), DistributeError> {
+        match self {
+            ModuleSource::CompileExamplesCrate => compile_examples_to_wasm().await,
+            ModuleSource::PkgDir(dir) => load_pkg_dir(dir),
+            ModuleSource::Prebuilt { wasm, glue } => Ok((wasm.clone(), glue.clone())),
+        }
+    }
+}
+
+/// Load `<name>_bg.wasm` + `<name>.js` from a wasm-pack output directory.
+fn load_pkg_dir(dir: &std::path::Path) -> Result<(Vec<u8>, String), DistributeError> {
+    let wasm_path = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with("_bg.wasm"))
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| format!("no *_bg.wasm found in {}", dir.display()))?;
+    let glue_name = wasm_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap()
+        .trim_end_matches("_bg.wasm")
+        .to_string()
+        + ".js";
+    let wasm = fs::read(&wasm_path)?;
+    let glue = fs::read_to_string(dir.join(glue_name))?;
+    Ok((wasm, glue))
+}
+
+fn module_content_hash(wasm: &[u8], glue: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(wasm);
+    hasher.update(glue.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct JobOptions {
     pub missing_chunks: MissingChunkPolicy,
-    /// Per-task timeout before the task is reassigned to another worker.
+    /// Per-task timeout before the task is requeued for another worker.
     pub task_timeout_secs: u64,
-    /// How many times a chunk may be reassigned before it counts as missing.
+    /// How many times a chunk may be retried before it counts as missing.
     pub max_retries: u32,
+    /// Where the job's WASM module comes from.
+    pub module: ModuleSource,
+    /// Start dispatching once this many workers are connected.
+    pub min_workers: usize,
+    /// How long to wait for `min_workers` before starting (or failing if none).
+    pub worker_wait_secs: u64,
+    /// Tasks kept in flight per worker (2 pipelines transfer behind compute).
+    pub max_inflight_per_worker: usize,
 }
 
 impl Default for JobOptions {
@@ -55,14 +133,24 @@ impl Default for JobOptions {
             missing_chunks: MissingChunkPolicy::Fail,
             task_timeout_secs: 30,
             max_retries: 3,
+            module: ModuleSource::CompileExamplesCrate,
+            min_workers: 1,
+            worker_wait_secs: 20,
+            max_inflight_per_worker: 2,
         }
     }
+}
+
+/// A control message from a worker (e.g. need_module).
+#[derive(Debug)]
+struct ControlMsg {
+    worker_id: String,
+    value: serde_json::Value,
 }
 
 /// A completed worker result delivered from the data-channel handler.
 #[derive(Debug)]
 struct WorkerResultMsg {
-    task_id: String,
     chunk_index: u32,
     worker_id: String,
     error: Option<String>,
@@ -70,13 +158,23 @@ struct WorkerResultMsg {
     bytes: Vec<u8>,
 }
 
-/// A task in flight, kept so it can be re-sent to another worker.
+/// Lifecycle of one chunk under the pull scheduler.
 #[derive(Debug, Clone)]
-struct PendingTask {
-    chunk_index: u32,
-    worker_id: String,
-    sent_at: std::time::Instant,
-    retry_count: u32,
+enum ChunkState {
+    Queued,
+    InFlight {
+        worker_id: String,
+        sent_at: std::time::Instant,
+    },
+    Done,
+    Failed,
+}
+
+struct ChunkRuntime {
+    input: Vec<u8>,
+    meta: serde_json::Value,
+    state: ChunkState,
+    retries: u32,
 }
 
 const BUFFERED_HIGH_WATER: usize = 4 * 1024 * 1024;
@@ -91,6 +189,8 @@ pub struct DistributedCompute {
     data_channels: Arc<Mutex<HashMap<String, Arc<RTCDataChannel>>>>,
     result_receiver: Option<mpsc::Receiver<WorkerResultMsg>>,
     result_sender: mpsc::Sender<WorkerResultMsg>,
+    control_receiver: Option<mpsc::Receiver<ControlMsg>>,
+    control_sender: mpsc::Sender<ControlMsg>,
     ws_sender: Option<
         Arc<
             Mutex<
@@ -109,6 +209,7 @@ pub struct DistributedCompute {
 impl DistributedCompute {
     async fn new() -> Result<Self, DistributeError> {
         let (result_sender, result_receiver) = mpsc::channel(256);
+        let (control_sender, control_receiver) = mpsc::channel(64);
         Ok(Self {
             ws_url: std::env::var("WASMHIVE_SIGNALING_URL")
                 .unwrap_or_else(|_| "ws://localhost:3000".to_string()),
@@ -118,6 +219,8 @@ impl DistributedCompute {
             data_channels: Arc::new(Mutex::new(HashMap::new())),
             result_receiver: Some(result_receiver),
             result_sender,
+            control_receiver: Some(control_receiver),
+            control_sender,
             ws_sender: None,
             failed_workers: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -166,17 +269,10 @@ impl DistributedCompute {
         println!("⚠️  Marked worker {} as failed", worker_id);
     }
 
-    /// Build and send one task to one worker. The WASM module and glue are
-    /// included only when the worker has not received them for this job yet.
-    async fn send_task(
+    async fn open_channel_to(
         &self,
         worker_id: &str,
-        header: &TaskHeader,
-        input: &[u8],
-        wasm: &[u8],
-        glue: &[u8],
-        workers_with_module: &mut HashSet<String>,
-    ) -> Result<(), DistributeError> {
+    ) -> Result<Arc<RTCDataChannel>, DistributeError> {
         let channel = {
             let channels = self.data_channels.lock().await;
             channels
@@ -187,232 +283,322 @@ impl DistributedCompute {
         if !matches!(channel.ready_state(), RTCDataChannelState::Open) {
             return Err(format!("data channel to {} is not open", worker_id).into());
         }
-        let include_module = !workers_with_module.contains(worker_id);
-        let payload = if include_module {
-            encode_task_payload(header, wasm, glue, input)
-        } else {
-            encode_task_payload(header, &[], &[], input)
-        };
-        let frames = split_into_frames(FRAME_TASK, &header.task_id, &payload);
-        Self::send_frames(&channel, &frames).await?;
-        if include_module {
-            workers_with_module.insert(worker_id.to_string());
-        }
-        Ok(())
+        Ok(channel)
     }
 
-    /// Run one job: distribute `chunks` (already encoded to bytes + meta),
-    /// collect results in chunk order, reassigning failed or timed-out tasks.
+    /// Send one task to one worker. Tasks carry only the module's content
+    /// hash; workers that lack the module request it with need_module.
+    async fn send_task(
+        &self,
+        worker_id: &str,
+        header: &TaskHeader,
+        input: &[u8],
+    ) -> Result<(), DistributeError> {
+        let channel = self.open_channel_to(worker_id).await?;
+        let payload = encode_task_payload(header, &[], &[], input);
+        let frames = split_into_frames(FRAME_TASK, &header.task_id, &payload);
+        Self::send_frames(&channel, &frames).await
+    }
+
+    /// Ship the job's module to a worker that requested it.
+    async fn send_module(
+        &self,
+        worker_id: &str,
+        module_frames: &[Vec<u8>],
+    ) -> Result<(), DistributeError> {
+        let channel = self.open_channel_to(worker_id).await?;
+        Self::send_frames(&channel, module_frames).await
+    }
+
+    /// Run one job under the pull scheduler: workers are fed `max_inflight_per_worker`
+    /// chunks at a time from a queue and get the next chunk as results return.
+    /// Workers that connect mid-job join the rotation automatically. Results
+    /// are collected in chunk order; timeouts and errors requeue the chunk.
     async fn execute_byte_job(
         &mut self,
         chunks: Vec<(Vec<u8>, serde_json::Value)>,
         wasm_bytes: &[u8],
         js_glue: &str,
+        module_hash: &str,
         map_function_name: &str,
         opts: &JobOptions,
     ) -> Result<Vec<Option<(serde_json::Value, Vec<u8>)>>, DistributeError> {
         self.connect_to_signaling_server().await?;
 
-        // Give discovery and channel setup a moment. Event-driven readiness
-        // replaces these fixed waits in a later phase.
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-        let available = self.get_available_workers().await;
-        if available.is_empty() {
-            self.disconnect_from_signaling_server().await?;
-            return Err("no workers with open data channels available".into());
-        }
+        // Event-driven readiness: start as soon as enough workers have open
+        // channels instead of sleeping a fixed amount.
+        let min_workers = opts.min_workers.max(1);
+        let wait_deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(opts.worker_wait_secs);
+        let ready_workers = loop {
+            let available = self.get_available_workers().await;
+            if available.len() >= min_workers {
+                break available;
+            }
+            if std::time::Instant::now() > wait_deadline {
+                if available.is_empty() {
+                    self.disconnect_from_signaling_server().await?;
+                    return Err(format!(
+                        "no workers connected within {}s",
+                        opts.worker_wait_secs
+                    )
+                    .into());
+                }
+                println!(
+                    "⚠️  Starting with {} workers ({} requested)",
+                    available.len(),
+                    min_workers
+                );
+                break available;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        };
 
         let job_id = uuid::Uuid::new_v4().to_string();
         let total = chunks.len();
         println!(
-            "📊 Job {}: {} chunks across {} workers (map fn: {})",
+            "📊 Job {}: {} chunks, {} workers ready, map fn {} (module {})",
             job_id,
             total,
-            available.len(),
-            map_function_name
+            ready_workers.len(),
+            map_function_name,
+            &module_hash[..12.min(module_hash.len())]
         );
 
-        // Job-local state.
-        let mut task_store: HashMap<String, (u32, Vec<u8>, serde_json::Value)> = HashMap::new();
-        let mut pending: HashMap<String, PendingTask> = HashMap::new();
+        // Job state.
+        let mut chunk_rt: Vec<ChunkRuntime> = chunks
+            .into_iter()
+            .map(|(input, meta)| ChunkRuntime {
+                input,
+                meta,
+                state: ChunkState::Queued,
+                retries: 0,
+            })
+            .collect();
+        let mut queue: VecDeque<usize> = (0..total).collect();
         let mut results: Vec<Option<(serde_json::Value, Vec<u8>)>> = vec![None; total];
-        let mut failed_chunks: BTreeSet<u32> = BTreeSet::new();
-        let mut received_task_ids: HashSet<String> = HashSet::new();
-        let mut workers_with_module: HashSet<String> = HashSet::new();
+        let mut inflight: HashMap<String, usize> = HashMap::new();
         let mut worker_strikes: HashMap<String, u32> = HashMap::new();
-        let mut rr_cursor = 0usize;
+        let mut sent_modules: HashSet<String> = HashSet::new();
+        let mut done = 0usize;
+        let mut failed = 0usize;
 
-        // Initial dispatch, round-robin over available workers.
-        let mut sent = 0usize;
-        for (i, (input, meta)) in chunks.into_iter().enumerate() {
-            let worker_id = available[i % available.len()].clone();
-            let task_id = format!("{}_{}", job_id, i);
-            let header = TaskHeader {
-                job_id: job_id.clone(),
-                task_id: task_id.clone(),
-                chunk_index: i as u32,
-                map_function: map_function_name.to_string(),
-                meta: meta.clone(),
-            };
-            match self
-                .send_task(
-                    &worker_id,
-                    &header,
-                    &input,
-                    wasm_bytes,
-                    js_glue.as_bytes(),
-                    &mut workers_with_module,
-                )
-                .await
-            {
-                Ok(()) => {
-                    pending.insert(
-                        task_id.clone(),
-                        PendingTask {
-                            chunk_index: i as u32,
-                            worker_id,
-                            sent_at: std::time::Instant::now(),
-                            retry_count: 0,
-                        },
-                    );
-                    sent += 1;
-                }
-                Err(e) => {
-                    println!("   ❌ Failed to send chunk {} to {}: {}", i, worker_id, e);
-                    self.mark_worker_failed(&worker_id).await;
-                    // Backdate so the next timeout pass reassigns it immediately.
-                    pending.insert(
-                        task_id.clone(),
-                        PendingTask {
-                            chunk_index: i as u32,
-                            worker_id,
-                            sent_at: std::time::Instant::now()
-                                - std::time::Duration::from_secs(opts.task_timeout_secs + 1),
-                            retry_count: 0,
-                        },
-                    );
-                }
-            }
-            task_store.insert(task_id, (i as u32, input, meta));
-        }
-        println!("   📤 {} of {} chunks dispatched", sent, total);
+        // Module frames are built once; shipped only to workers that ask.
+        let module_frames = split_into_frames(
+            FRAME_MODULE,
+            module_hash,
+            &encode_module_payload(module_hash, wasm_bytes, js_glue.as_bytes()),
+        );
 
-        // Collect with reassignment.
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_secs((10 * total as u64).clamp(120, 600));
         let mut last_activity = std::time::Instant::now();
         let mut last_timeout_check = std::time::Instant::now();
-        let mut completed = 0usize;
 
-        let mut receiver = self
+        let mut result_rx = self
             .result_receiver
             .take()
             .ok_or("result receiver already taken")?;
+        let mut control_rx = self
+            .control_receiver
+            .take()
+            .ok_or("control receiver already taken")?;
 
-        while completed + failed_chunks.len() < total {
+        while done + failed < total {
             if std::time::Instant::now() > deadline {
-                println!(
-                    "⏱️  Job deadline reached with {} tasks unresolved",
-                    pending.len()
-                );
+                println!("⏱️  Job deadline reached with {} chunks unresolved", total - done - failed);
                 break;
             }
             if last_activity.elapsed().as_secs() > 90 {
-                println!("⏱️  No results for 90s; stopping collection");
+                println!("⏱️  No activity for 90s; stopping collection");
                 break;
             }
 
+            // Top up every available worker to its in-flight cap. Workers that
+            // connected after the job started are picked up here.
+            let available = self.get_available_workers().await;
+            'workers: for worker_id in &available {
+                while *inflight.get(worker_id).unwrap_or(&0) < opts.max_inflight_per_worker {
+                    // Next chunk that is actually still queued.
+                    let idx = loop {
+                        match queue.pop_front() {
+                            Some(i) => {
+                                if matches!(chunk_rt[i].state, ChunkState::Queued) {
+                                    break Some(i);
+                                }
+                            }
+                            None => break None,
+                        }
+                    };
+                    let Some(idx) = idx else { break 'workers };
+
+                    let header = TaskHeader {
+                        job_id: job_id.clone(),
+                        task_id: format!("{}_{}", job_id, idx),
+                        chunk_index: idx as u32,
+                        map_function: map_function_name.to_string(),
+                        module_hash: module_hash.to_string(),
+                        meta: chunk_rt[idx].meta.clone(),
+                    };
+                    match self.send_task(worker_id, &header, &chunk_rt[idx].input).await {
+                        Ok(()) => {
+                            chunk_rt[idx].state = ChunkState::InFlight {
+                                worker_id: worker_id.clone(),
+                                sent_at: std::time::Instant::now(),
+                            };
+                            *inflight.entry(worker_id.clone()).or_insert(0) += 1;
+                        }
+                        Err(e) => {
+                            println!("   ❌ Send to {} failed: {}", worker_id, e);
+                            self.mark_worker_failed(worker_id).await;
+                            queue.push_front(idx);
+                            continue 'workers;
+                        }
+                    }
+                }
+            }
+
+            // Requeue chunks whose worker sat on them past the timeout. A
+            // stuck-but-connected worker looks exactly like a slow one; the
+            // first result wins and duplicates are ignored via chunk state.
             if last_timeout_check.elapsed().as_secs() >= 5 {
-                self.reassign_timed_out(
-                    &mut pending,
-                    &task_store,
-                    &mut failed_chunks,
-                    &mut worker_strikes,
-                    &mut workers_with_module,
-                    &mut rr_cursor,
-                    wasm_bytes,
-                    js_glue,
-                    map_function_name,
-                    &job_id,
-                    opts,
-                )
-                .await;
+                for idx in 0..total {
+                    let ChunkState::InFlight { worker_id, sent_at } = chunk_rt[idx].state.clone()
+                    else {
+                        continue;
+                    };
+                    if sent_at.elapsed().as_secs() <= opts.task_timeout_secs {
+                        continue;
+                    }
+                    let strikes = worker_strikes.entry(worker_id.clone()).or_insert(0);
+                    *strikes += 1;
+                    if *strikes >= WORKER_STRIKE_LIMIT {
+                        self.mark_worker_failed(&worker_id).await;
+                    }
+                    if let Some(n) = inflight.get_mut(&worker_id) {
+                        *n = n.saturating_sub(1);
+                    }
+                    chunk_rt[idx].retries += 1;
+                    if chunk_rt[idx].retries > opts.max_retries {
+                        println!(
+                            "   ☠️  Chunk {} exhausted {} retries; marking missing",
+                            idx, opts.max_retries
+                        );
+                        chunk_rt[idx].state = ChunkState::Failed;
+                        failed += 1;
+                    } else {
+                        println!(
+                            "   🔄 Chunk {} timed out on {}; requeued (retry {})",
+                            idx, worker_id, chunk_rt[idx].retries
+                        );
+                        chunk_rt[idx].state = ChunkState::Queued;
+                        queue.push_back(idx);
+                    }
+                }
                 last_timeout_check = std::time::Instant::now();
             }
 
-            let msg = match tokio::time::timeout(
-                tokio::time::Duration::from_millis(1000),
-                receiver.recv(),
-            )
-            .await
-            {
-                Ok(Some(m)) => m,
-                Ok(None) => {
-                    println!("   ⚠️  Result channel closed");
-                    break;
-                }
-                Err(_) => continue,
-            };
-
-            if received_task_ids.contains(&msg.task_id) {
-                continue; // late duplicate after a reassignment
-            }
-
-            if let Some(err) = msg.error {
-                println!(
-                    "   ❌ Worker {} failed task {} (chunk {}): {}",
-                    msg.worker_id, msg.task_id, msg.chunk_index, err
-                );
-                if err.contains("no cached module") {
-                    // Coordination artifact, not a worker fault: the worker lost
-                    // (or never got) the module. Re-send with the module included.
-                    workers_with_module.remove(&msg.worker_id);
-                } else {
-                    let strikes = worker_strikes.entry(msg.worker_id.clone()).or_insert(0);
-                    *strikes += 1;
-                    if *strikes >= WORKER_STRIKE_LIMIT {
-                        self.mark_worker_failed(&msg.worker_id).await;
+            tokio::select! {
+                msg = result_rx.recv() => {
+                    let Some(msg) = msg else {
+                        println!("   ⚠️  Result channel closed");
+                        break;
+                    };
+                    last_activity = std::time::Instant::now();
+                    if let Some(n) = inflight.get_mut(&msg.worker_id) {
+                        *n = n.saturating_sub(1);
+                    }
+                    let idx = msg.chunk_index as usize;
+                    if idx >= total {
+                        println!("   ⚠️  Result with out-of-range chunk index {}", idx);
+                        continue;
+                    }
+                    if matches!(chunk_rt[idx].state, ChunkState::Done | ChunkState::Failed) {
+                        continue; // late duplicate after a requeue
+                    }
+                    if let Some(err) = msg.error {
+                        println!(
+                            "   ❌ Worker {} failed chunk {}: {}",
+                            msg.worker_id, idx, err
+                        );
+                        if err.contains("module") {
+                            // Module never arrived or was lost; allow a re-send.
+                            sent_modules.remove(&msg.worker_id);
+                        } else {
+                            let strikes = worker_strikes.entry(msg.worker_id.clone()).or_insert(0);
+                            *strikes += 1;
+                            if *strikes >= WORKER_STRIKE_LIMIT {
+                                self.mark_worker_failed(&msg.worker_id).await;
+                            }
+                        }
+                        chunk_rt[idx].retries += 1;
+                        if chunk_rt[idx].retries > opts.max_retries {
+                            chunk_rt[idx].state = ChunkState::Failed;
+                            failed += 1;
+                        } else {
+                            chunk_rt[idx].state = ChunkState::Queued;
+                            queue.push_back(idx);
+                        }
+                        continue;
+                    }
+                    chunk_rt[idx].state = ChunkState::Done;
+                    results[idx] = Some((msg.meta, msg.bytes));
+                    done += 1;
+                    if done % 10 == 0 || done == total {
+                        println!("   📥 {}/{} results", done, total);
                     }
                 }
-                if let Some(p) = pending.get_mut(&msg.task_id) {
-                    // Force the next timeout pass to reassign it immediately.
-                    p.sent_at = std::time::Instant::now()
-                        - std::time::Duration::from_secs(opts.task_timeout_secs + 1);
+                ctl = control_rx.recv() => {
+                    let Some(ctl) = ctl else { continue };
+                    last_activity = std::time::Instant::now();
+                    let msg_type = ctl.value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if msg_type == "need_module" {
+                        let requested = ctl
+                            .value
+                            .get("module_hash")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if requested != module_hash {
+                            println!(
+                                "   ⚠️  {} requested unknown module {}",
+                                ctl.worker_id,
+                                &requested[..12.min(requested.len())]
+                            );
+                        } else if sent_modules.contains(&ctl.worker_id) {
+                            // Already in flight to this worker; ignore.
+                        } else {
+                            println!(
+                                "   📦 Shipping module ({} frames) to {}",
+                                module_frames.len(),
+                                ctl.worker_id
+                            );
+                            sent_modules.insert(ctl.worker_id.clone());
+                            if let Err(e) = self.send_module(&ctl.worker_id, &module_frames).await {
+                                println!("   ❌ Module send to {} failed: {}", ctl.worker_id, e);
+                                sent_modules.remove(&ctl.worker_id);
+                                self.mark_worker_failed(&ctl.worker_id).await;
+                            }
+                        }
+                    }
                 }
-                last_activity = std::time::Instant::now();
-                continue;
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)) => {}
             }
-
-            let idx = msg.chunk_index as usize;
-            if idx >= results.len() {
-                println!("   ⚠️  Result with out-of-range chunk index {}", idx);
-                continue;
-            }
-            pending.remove(&msg.task_id);
-            received_task_ids.insert(msg.task_id);
-            if results[idx].is_none() {
-                results[idx] = Some((msg.meta, msg.bytes));
-                completed += 1;
-                if completed % 10 == 0 || completed == total {
-                    println!("   📥 {}/{} results", completed, total);
-                }
-            }
-            last_activity = std::time::Instant::now();
         }
 
-        self.result_receiver = Some(receiver);
+        self.result_receiver = Some(result_rx);
+        self.control_receiver = Some(control_rx);
 
-        // Anything still pending counts as missing.
-        for (_, p) in pending.drain() {
-            failed_chunks.insert(p.chunk_index);
+        // Anything not done counts as missing.
+        let mut missing: Vec<u32> = Vec::new();
+        for (idx, c) in chunk_rt.iter().enumerate() {
+            if !matches!(c.state, ChunkState::Done) {
+                missing.push(idx as u32);
+            }
         }
 
         self.disconnect_from_signaling_server().await?;
 
-        if !failed_chunks.is_empty() {
-            let missing: Vec<u32> = failed_chunks.iter().copied().collect();
+        if !missing.is_empty() {
             match opts.missing_chunks {
                 MissingChunkPolicy::Fail => {
                     return Err(format!(
@@ -433,116 +619,8 @@ impl DistributedCompute {
                 }
             }
         }
-        println!("✅ Job complete: {}/{} chunks", completed, total);
+        println!("✅ Job complete: {}/{} chunks", done, total);
         Ok(results)
-    }
-
-    /// Reassign tasks that exceeded the per-task timeout, regardless of
-    /// whether their worker's channel is still open (a stuck worker looks
-    /// exactly like a slow one from the outside). First result wins; late
-    /// duplicates are deduplicated by task id.
-    #[allow(clippy::too_many_arguments)]
-    async fn reassign_timed_out(
-        &self,
-        pending: &mut HashMap<String, PendingTask>,
-        task_store: &HashMap<String, (u32, Vec<u8>, serde_json::Value)>,
-        failed_chunks: &mut BTreeSet<u32>,
-        worker_strikes: &mut HashMap<String, u32>,
-        workers_with_module: &mut HashSet<String>,
-        rr_cursor: &mut usize,
-        wasm_bytes: &[u8],
-        js_glue: &str,
-        map_function_name: &str,
-        job_id: &str,
-        opts: &JobOptions,
-    ) {
-        let now = std::time::Instant::now();
-        let timed_out: Vec<String> = pending
-            .iter()
-            .filter(|(_, p)| now.duration_since(p.sent_at).as_secs() > opts.task_timeout_secs)
-            .map(|(id, _)| id.clone())
-            .collect();
-        if timed_out.is_empty() {
-            return;
-        }
-
-        let available = self.get_available_workers().await;
-        for task_id in timed_out {
-            let Some(p) = pending.get(&task_id).cloned() else {
-                continue;
-            };
-
-            // Strike the worker that sat on it.
-            let strikes = worker_strikes.entry(p.worker_id.clone()).or_insert(0);
-            *strikes += 1;
-            if *strikes >= WORKER_STRIKE_LIMIT {
-                self.mark_worker_failed(&p.worker_id).await;
-            }
-
-            if p.retry_count >= opts.max_retries {
-                println!(
-                    "   ☠️  Chunk {} exhausted {} retries; marking missing",
-                    p.chunk_index, opts.max_retries
-                );
-                pending.remove(&task_id);
-                failed_chunks.insert(p.chunk_index);
-                continue;
-            }
-
-            // Prefer a different worker; fall back to any available one.
-            let candidates: Vec<&String> =
-                available.iter().filter(|w| **w != p.worker_id).collect();
-            let target = if !candidates.is_empty() {
-                *rr_cursor += 1;
-                Some(candidates[*rr_cursor % candidates.len()].clone())
-            } else {
-                available.first().cloned()
-            };
-            let Some(target) = target else {
-                continue; // no workers right now; retry on a later pass
-            };
-
-            let Some((chunk_index, input, meta)) = task_store.get(&task_id) else {
-                continue;
-            };
-            let header = TaskHeader {
-                job_id: job_id.to_string(),
-                task_id: task_id.clone(),
-                chunk_index: *chunk_index,
-                map_function: map_function_name.to_string(),
-                meta: meta.clone(),
-            };
-            match self
-                .send_task(
-                    &target,
-                    &header,
-                    input,
-                    wasm_bytes,
-                    js_glue.as_bytes(),
-                    workers_with_module,
-                )
-                .await
-            {
-                Ok(()) => {
-                    println!(
-                        "   🔄 Reassigned chunk {} from {} to {} (retry {})",
-                        chunk_index,
-                        p.worker_id,
-                        target,
-                        p.retry_count + 1
-                    );
-                    if let Some(entry) = pending.get_mut(&task_id) {
-                        entry.worker_id = target;
-                        entry.sent_at = std::time::Instant::now();
-                        entry.retry_count += 1;
-                    }
-                }
-                Err(e) => {
-                    println!("   ❌ Reassignment to {} failed: {}", target, e);
-                    self.mark_worker_failed(&target).await;
-                }
-            }
-        }
     }
 
     async fn connect_to_signaling_server(&mut self) -> Result<(), DistributeError> {
@@ -566,6 +644,7 @@ impl DistributedCompute {
         let peer_connections_arc = self.peer_connections.clone();
         let data_channels_arc = self.data_channels.clone();
         let result_sender = self.result_sender.clone();
+        let control_sender = self.control_sender.clone();
         let failed_workers_arc = self.failed_workers.clone();
 
         tokio::spawn(async move {
@@ -625,6 +704,7 @@ impl DistributedCompute {
                                                     peer_connections_arc.clone(),
                                                     data_channels_arc.clone(),
                                                     result_sender.clone(),
+                                                    control_sender.clone(),
                                                     failed_workers_arc.clone(),
                                                 )
                                                 .await;
@@ -706,6 +786,7 @@ impl DistributedCompute {
         >,
         data_channels_arc: Arc<Mutex<HashMap<String, Arc<RTCDataChannel>>>>,
         result_sender: mpsc::Sender<WorkerResultMsg>,
+        control_sender: mpsc::Sender<ControlMsg>,
         failed_workers_arc: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     ) {
         let worker_id_for_channel = worker_id.clone();
@@ -772,6 +853,7 @@ impl DistributedCompute {
 
             pc.on_data_channel(Box::new(move |data_channel| {
                 let result_sender = result_sender.clone();
+                let control_sender = control_sender.clone();
                 let worker_id = worker_id_for_channel.clone();
                 let data_channels_arc = data_channels_arc.clone();
 
@@ -787,6 +869,7 @@ impl DistributedCompute {
                     let worker_id_for_msg = worker_id.clone();
                     data_channel.on_message(Box::new(move |msg| {
                         let result_sender = result_sender.clone();
+                        let control_sender = control_sender.clone();
                         let reassembler = reassembler.clone();
                         let worker_id = worker_id_for_msg.clone();
                         Box::pin(async move {
@@ -804,15 +887,14 @@ impl DistributedCompute {
                                 let mut r = reassembler.lock().await;
                                 r.accept(frame)
                             };
-                            if let Some((ftype, _id, payload)) = completed {
-                                if ftype != FRAME_RESULT {
-                                    return;
-                                }
-                                match decode_result_payload(&payload) {
+                            let Some((ftype, _id, payload)) = completed else {
+                                return;
+                            };
+                            match ftype {
+                                FRAME_RESULT => match decode_result_payload(&payload) {
                                     Ok((header, body)) => {
                                         let _ = result_sender
                                             .send(WorkerResultMsg {
-                                                task_id: header.task_id,
                                                 chunk_index: header.chunk_index,
                                                 worker_id: header.worker_id,
                                                 error: header.error,
@@ -824,6 +906,30 @@ impl DistributedCompute {
                                     Err(e) => {
                                         println!("❌ Bad result payload from {}: {}", worker_id, e);
                                     }
+                                },
+                                FRAME_CONTROL => {
+                                    match serde_json::from_slice::<serde_json::Value>(&payload) {
+                                        Ok(value) => {
+                                            let _ = control_sender
+                                                .send(ControlMsg {
+                                                    worker_id: worker_id.clone(),
+                                                    value,
+                                                })
+                                                .await;
+                                        }
+                                        Err(e) => {
+                                            println!(
+                                                "❌ Bad control payload from {}: {}",
+                                                worker_id, e
+                                            );
+                                        }
+                                    }
+                                }
+                                other => {
+                                    println!(
+                                        "⚠️  Unexpected frame type {} from {}",
+                                        other, worker_id
+                                    );
                                 }
                             }
                         })
@@ -865,7 +971,21 @@ impl DistributedCompute {
     }
 }
 
+/// Compiled-examples memo: wasm-pack output is not byte-identical across
+/// rebuilds, which would defeat content-hash caching between jobs in the
+/// same process (e.g. benchmark iterations). Compile once per process.
+static COMPILED_EXAMPLES: std::sync::OnceLock<(Vec<u8>, String)> = std::sync::OnceLock::new();
+
 async fn compile_examples_to_wasm() -> Result<(Vec<u8>, String), DistributeError> {
+    if let Some((wasm, glue)) = COMPILED_EXAMPLES.get() {
+        return Ok((wasm.clone(), glue.clone()));
+    }
+    let result = compile_examples_to_wasm_uncached().await?;
+    let _ = COMPILED_EXAMPLES.set(result.clone());
+    Ok(result)
+}
+
+async fn compile_examples_to_wasm_uncached() -> Result<(Vec<u8>, String), DistributeError> {
     use std::path::PathBuf;
     println!("🔧 Compiling examples to WASM for distributed execution...");
 
@@ -995,7 +1115,8 @@ where
         map_function_name
     );
 
-    let (wasm_bytes, js_glue) = compile_examples_to_wasm().await?;
+    let (wasm_bytes, js_glue) = opts.module.resolve().await?;
+    let module_hash = module_content_hash(&wasm_bytes, &js_glue);
 
     let chunks = chunker(&input);
     let mut encoded: Vec<(Vec<u8>, serde_json::Value)> = Vec::with_capacity(chunks.len());
@@ -1011,7 +1132,14 @@ where
 
     let mut distributor = DistributedCompute::new().await?;
     let results = distributor
-        .execute_byte_job(encoded, &wasm_bytes, &js_glue, map_function_name, &opts)
+        .execute_byte_job(
+            encoded,
+            &wasm_bytes,
+            &js_glue,
+            &module_hash,
+            map_function_name,
+            &opts,
+        )
         .await?;
 
     let mut outputs: Vec<ItemOutput> = Vec::with_capacity(results.len());
