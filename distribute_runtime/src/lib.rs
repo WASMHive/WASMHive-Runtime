@@ -47,6 +47,8 @@ pub enum MissingChunkPolicy {
 pub enum ModuleSource {
     /// Compile the workspace `examples` crate with wasm-pack (the historical default).
     CompileExamplesCrate,
+    /// Compile any wasm-pack-able crate directory and load its `pkg/`.
+    CompileCrate(std::path::PathBuf),
     /// Load a prebuilt wasm-pack `pkg/` directory (any crate, no framework changes).
     PkgDir(std::path::PathBuf),
     /// Bytes supplied directly by the caller.
@@ -57,6 +59,7 @@ impl std::fmt::Debug for ModuleSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ModuleSource::CompileExamplesCrate => write!(f, "CompileExamplesCrate"),
+            ModuleSource::CompileCrate(p) => write!(f, "CompileCrate({})", p.display()),
             ModuleSource::PkgDir(p) => write!(f, "PkgDir({})", p.display()),
             ModuleSource::Prebuilt { wasm, glue } => {
                 write!(f, "Prebuilt {{ wasm: {}B, glue: {}B }}", wasm.len(), glue.len())
@@ -69,6 +72,7 @@ impl ModuleSource {
     async fn resolve(&self) -> Result<(Vec<u8>, String), DistributeError> {
         match self {
             ModuleSource::CompileExamplesCrate => compile_examples_to_wasm().await,
+            ModuleSource::CompileCrate(dir) => compile_crate_dir(dir).await,
             ModuleSource::PkgDir(dir) => load_pkg_dir(dir),
             ModuleSource::Prebuilt { wasm, glue } => Ok((wasm.clone(), glue.clone())),
         }
@@ -971,23 +975,44 @@ impl DistributedCompute {
     }
 }
 
-/// Compiled-examples memo: wasm-pack output is not byte-identical across
+/// Compiled-crate memo: wasm-pack output is not byte-identical across
 /// rebuilds, which would defeat content-hash caching between jobs in the
-/// same process (e.g. benchmark iterations). Compile once per process.
-static COMPILED_EXAMPLES: std::sync::OnceLock<(Vec<u8>, String)> = std::sync::OnceLock::new();
+/// same process (e.g. benchmark iterations). Compile each crate dir once
+/// per process.
+static COMPILED_CRATES: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, (Vec<u8>, String)>>,
+> = std::sync::OnceLock::new();
 
-async fn compile_examples_to_wasm() -> Result<(Vec<u8>, String), DistributeError> {
-    if let Some((wasm, glue)) = COMPILED_EXAMPLES.get() {
+/// Run wasm-pack in `dir` and load the resulting `pkg/`, memoized per path.
+async fn compile_crate_dir(dir: &std::path::Path) -> Result<(Vec<u8>, String), DistributeError> {
+    let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let memo = COMPILED_CRATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Some((wasm, glue)) = memo.lock().unwrap().get(&key) {
         return Ok((wasm.clone(), glue.clone()));
     }
-    let result = compile_examples_to_wasm_uncached().await?;
-    let _ = COMPILED_EXAMPLES.set(result.clone());
+
+    println!("🔧 Compiling {} to WASM with wasm-pack...", dir.display());
+    let output = Command::new("wasm-pack")
+        .args(["build", "--target", "web", "--out-dir", "pkg"])
+        .current_dir(dir)
+        .output()?;
+    if !output.status.success() {
+        let error_msg = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("WASM compilation failed: {}", error_msg).into());
+    }
+
+    let result = load_pkg_dir(&dir.join("pkg"))?;
+    println!(
+        "📦 WASM module {} bytes, JS glue {} bytes",
+        result.0.len(),
+        result.1.len()
+    );
+    memo.lock().unwrap().insert(key, result.clone());
     Ok(result)
 }
 
-async fn compile_examples_to_wasm_uncached() -> Result<(Vec<u8>, String), DistributeError> {
+async fn compile_examples_to_wasm() -> Result<(Vec<u8>, String), DistributeError> {
     use std::path::PathBuf;
-    println!("🔧 Compiling examples to WASM for distributed execution...");
 
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(override_dir) = std::env::var("W3DGE_WASM_EXAMPLES_DIR") {
@@ -1019,25 +1044,7 @@ async fn compile_examples_to_wasm_uncached() -> Result<(Vec<u8>, String), Distri
             )
         })?;
 
-    println!("📁 Using examples directory: {}", examples_dir.display());
-
-    let output = Command::new("wasm-pack")
-        .args(["build", "--target", "web", "--out-dir", "pkg"])
-        .current_dir(&examples_dir)
-        .output()?;
-    if !output.status.success() {
-        let error_msg = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("WASM compilation failed: {}", error_msg).into());
-    }
-
-    let wasm_bytes = fs::read(examples_dir.join("pkg").join("distributed_examples_bg.wasm"))?;
-    let js_glue = fs::read_to_string(examples_dir.join("pkg").join("distributed_examples.js"))?;
-    println!(
-        "📦 WASM module {} bytes, JS glue {} bytes",
-        wasm_bytes.len(),
-        js_glue.len()
-    );
-    Ok((wasm_bytes, js_glue))
+    compile_crate_dir(&examples_dir).await
 }
 
 /// General byte-based distributed map-reduce with default options.
