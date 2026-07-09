@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
     // Read URLs from crawl_these.txt
     let input_file = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "crawl_these.txt".to_string());
+        .unwrap_or_else(|| "examples_webcrawl/sample_urls.txt".to_string());
     
     println!("📖 Reading URLs from: {}", input_file);
     let content = fs::read_to_string(&input_file)

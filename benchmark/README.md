@@ -60,12 +60,13 @@ Before running benchmarks:
 
 1. **Start the WebSocket signaling server**:
    ```bash
-   cd network/server
+   # from a clone of WASMHive-WebApp
+   cd server
    node websocket-server.js
    ```
 
 2. **Open worker nodes in browsers**:
-   - Open `network/worker/index.html` in one or more browser tabs
+   - Open `worker/index.html` from the WASMHive-WebApp repo in one or more browser tabs
    - Each tab represents one worker node
    - Open as many tabs as the maximum worker count you want to test
 

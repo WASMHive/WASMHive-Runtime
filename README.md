@@ -4,6 +4,8 @@ The Rust core of **WASMHive**: a distributed computing framework that turns ordi
 
 The browser side (signaling server, CORS proxy, and the worker page) lives in [WASMHive-WebApp](https://github.com/WASMHive/WASMHive-WebApp). The containerized baseline we benchmark against lives in [docker-hive](https://github.com/WASMHive/docker-hive).
 
+> Built as a PES University computer science capstone (2025-2026). The project is complete and stable; it is not under active development, but everything here runs as documented.
+
 ## 🏗️ Architecture
 
 ```
@@ -68,8 +70,9 @@ cargo run -p distributed_examples
 # Video grayscale (writes bw_output.mp4)
 cargo run -p examples_bw -- input.mp4 30
 
-# Web crawl (reads crawl_these.txt, writes webcrawl_results.txt)
-cargo run -p examples_webcrawl
+# Web crawl (needs the CORS proxy from WASMHive-WebApp; writes webcrawl_results.txt)
+cargo run -p examples_webcrawl                    # uses the bundled sample_urls.txt
+cargo run -p examples_webcrawl -- my_urls.txt     # or your own list, one URL per line
 ```
 
 Each worker tab shows the network topology, task history, and health status while jobs run.
