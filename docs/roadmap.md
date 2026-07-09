@@ -2,13 +2,13 @@
 
 Ordered by priority. Items marked (bug) affect correctness.
 
-Phase 1 (July 2026) landed the binary framed protocol, the unified byte pipeline, ordered results with an explicit missing-chunk policy, and the fault-tolerance fixes below.
+Phase 1 (July 2026) landed the binary framed protocol, the unified byte pipeline, ordered results with an explicit missing-chunk policy, and the fault-tolerance fixes below. Phase 2 (July 2026) landed content-hash module artifacts, the pull scheduler, and event-driven job start.
 
 ## P0: one runtime that generalizes to any task
 
 - [x] Unify the numeric and byte task paths into a single byte-based path; numeric jobs are now an encoder/decoder over the general pipeline. `ExecutionMode` no longer selects function names.
 - [x] Make the worker a pure dispatcher: `wasmModule[map_function](bytes, meta)` uniformly; function-name special cases and worker-side PNG encoding removed (output encoding is app-side now).
-- [ ] Stop hardcoding the WASM artifact: accept a prebuilt module path (or crate directory) per job, cache modules on workers by content hash, and let workers request a module they are missing. New task types then become new crates, with no framework changes. (Interim: modules are cached per job id and re-sent on demand.)
+- [x] Stop hardcoding the WASM artifact: `JobOptions.module` accepts the examples crate (default), any wasm-pack `pkg/` directory, or prebuilt bytes. Tasks reference modules by sha256; workers cache by hash across jobs and pull missing modules with `need_module`. New task types are new crates, with no framework changes. (Note: wasm-pack rebuilds are not byte-identical, so the compiled-examples default memoizes per process; prebuilt artifacts get stable hashes across processes.)
 
 ## P1: correctness and performance
 
@@ -18,8 +18,8 @@ Phase 1 (July 2026) landed the binary framed protocol, the unified byte pipeline
 - [x] (bug) Tasks on a connected-but-stuck worker are reassigned on timeout (first result wins, duplicates deduplicated); retry-exhausted chunks are dropped from pending and counted as missing; failed workers are rehabilitated after a cooldown.
 - [x] Results are chunked worker-to-master exactly like tasks master-to-worker (framed transfers both directions). Supersedes the WebApp `result-chunking` branch.
 - [x] Binary data-channel frames (raw bytes, no base64) with bufferedAmount backpressure on both sides.
-- [ ] Replace fixed discovery sleeps (3s + 5s) with event-driven readiness; dispatch as soon as N channels are open.
-- [ ] Pull-based scheduling: keep a task queue and send the next chunk when a worker returns a result, instead of assigning everything upfront.
+- [x] Fixed discovery sleeps (3s + 5s) replaced by readiness polling: jobs start as soon as `min_workers` channels are open (measured: a warm 8-task job dropped from 9.2s to 0.25s).
+- [x] Pull-based scheduling: a task queue feeds each worker up to `max_inflight_per_worker`; the next chunk ships when a result returns. Workers that connect mid-job join the rotation automatically (measured: a worker joining 3s into a 600-frame job took 256 of the 600 tasks).
 
 ## P2: hygiene
 
