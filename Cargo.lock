@@ -895,6 +895,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "examples_raytrace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "distribute_runtime",
+ "image",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "examples_webcrawl"
 version = "0.1.0"
 dependencies = [

@@ -1,3 +1,10 @@
 [workspace]
-members = ["distribute_runtime", "examples", "examples_bw", "examples_webcrawl", "benchmark"]
+members = [
+    "distribute_runtime",
+    "examples",
+    "examples_bw",
+    "examples_webcrawl",
+    "examples_raytrace",
+    "benchmark",
+]
 resolver = "2"
