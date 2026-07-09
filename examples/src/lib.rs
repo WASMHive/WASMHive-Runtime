@@ -1,5 +1,5 @@
-use wasm_bindgen::prelude::*;
 use std::num::NonZeroU64;
+use wasm_bindgen::prelude::*;
 use wgpu::util::DeviceExt;
 
 // Native-only code (not compiled to WASM)
@@ -37,45 +37,81 @@ pub mod native {
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::*;
 
-// WASM functions - these are compiled to WASM and run on workers
-#[wasm_bindgen]
-pub fn cpu_map(x: f32) -> f32 {
-    x
+// ---------------------------------------------------------------------------
+// Worker map functions.
+//
+// Every function shipped to workers follows one contract:
+//     fn(input: Vec<u8>, meta: JsValue) -> Vec<u8>   (sync or async)
+// The worker dispatches by name with no per-function knowledge; how the bytes
+// are interpreted is between the master-side encoder/decoder and the function.
+// ---------------------------------------------------------------------------
+
+fn le_bytes_to_f32s(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
-#[wasm_bindgen]
-pub async fn gpu_map(input: Vec<f32>) -> Vec<f32> {
-    use log::info;
-    console_log::init_with_level(log::Level::Info).ok(); // ok() to ignore if already initialized
-
-    info!("🎮 gpu_map called with {} elements", input.len());
-
-    if input.is_empty() {
-        info!("⚠️ Empty input, returning empty result");
-        return vec![];
+fn f32s_to_le_bytes(vals: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() * 4);
+    for v in vals {
+        out.extend_from_slice(&v.to_le_bytes());
     }
+    out
+}
 
-    info!("🔧 Creating WebGPU instance...");
+fn cpu_square(vals: &[f32]) -> Vec<f32> {
+    vals.iter().map(|x| x * x).collect()
+}
+
+/// Square each f32 on the CPU. Input and output are little-endian f32 bytes.
+#[wasm_bindgen]
+pub fn cpu_map(input: Vec<u8>, _meta: JsValue) -> Vec<u8> {
+    let floats = le_bytes_to_f32s(&input);
+    f32s_to_le_bytes(&cpu_square(&floats))
+}
+
+/// Square each f32 on the GPU via WebGPU, falling back to the CPU when no
+/// adapter or compute support is available. Input/output are LE f32 bytes.
+#[wasm_bindgen]
+pub async fn gpu_map(input: Vec<u8>, _meta: JsValue) -> Vec<u8> {
+    use log::info;
+    console_log::init_with_level(log::Level::Info).ok();
+
+    let floats = le_bytes_to_f32s(&input);
+    if floats.is_empty() {
+        return Vec::new();
+    }
+    match gpu_square(&floats).await {
+        Ok(out) => f32s_to_le_bytes(&out),
+        Err(e) => {
+            info!("⚠️ WebGPU unavailable ({}); falling back to CPU", e);
+            f32s_to_le_bytes(&cpu_square(&floats))
+        }
+    }
+}
+
+async fn gpu_square(input: &[f32]) -> Result<Vec<f32>, String> {
+    use log::info;
+
+    info!("🎮 gpu_square called with {} elements", input.len());
+
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
 
-    info!("🔍 Requesting WebGPU adapter...");
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions::default())
         .await
-        .expect("Failed to create WebGPU adapter");
-    info!("✅ WebGPU adapter created successfully");
+        .map_err(|e| format!("no WebGPU adapter: {e:?}"))?;
 
     let downlevel_capabilities = adapter.get_downlevel_capabilities();
-    assert!(
-        downlevel_capabilities
-            .flags
-            .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS),
-        "Adapter does not support compute shaders"
-    );
-    info!("✅ Compute shaders supported");
+    if !downlevel_capabilities
+        .flags
+        .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+    {
+        return Err("adapter does not support compute shaders".into());
+    }
 
-    info!("🔧 Requesting WebGPU device...");
-    // Use the adapter's supported limits to avoid compatibility issues
     let adapter_limits = adapter.limits();
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
@@ -86,14 +122,13 @@ pub async fn gpu_map(input: Vec<f32>) -> Vec<f32> {
             trace: wgpu::Trace::Off,
         })
         .await
-        .expect("Failed to create WebGPU device");
-    info!("✅ WebGPU device created successfully");
+        .map_err(|e| format!("failed to create WebGPU device: {e:?}"))?;
 
     let module = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
     let input_data_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
-        contents: bytemuck::cast_slice(&input),
+        contents: bytemuck::cast_slice(input),
         usage: wgpu::BufferUsages::STORAGE,
     });
 
@@ -162,7 +197,7 @@ pub async fn gpu_map(input: Vec<f32>) -> Vec<f32> {
         label: None,
         layout: Some(&pipeline_layout),
         module: &module,
-        entry_point: Some("doubleMe"),
+        entry_point: Some("square_map"),
         compilation_options: wgpu::PipelineCompilationOptions::default(),
         cache: None,
     });
@@ -194,26 +229,22 @@ pub async fn gpu_map(input: Vec<f32>) -> Vec<f32> {
 
     let buffer_slice = download_buffer.slice(..);
 
-    info!("📥 Mapping buffer to read results...");
-    // Properly await the mapping
     let (sender, receiver) = futures::channel::oneshot::channel();
     buffer_slice.map_async(wgpu::MapMode::Read, move |v| {
-        sender.send(v).unwrap();
+        let _ = sender.send(v);
     });
     let _ = device.poll(wgpu::PollType::Wait);
 
-    // Await the mapping result
     receiver
         .await
-        .expect("Failed to receive mapping result")
-        .expect("Buffer mapping error");
-    info!("✅ Buffer mapped successfully");
+        .map_err(|_| "buffer mapping callback dropped".to_string())?
+        .map_err(|e| format!("buffer mapping failed: {e:?}"))?;
 
     let data = buffer_slice.get_mapped_range();
     let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
 
-    info!("🎉 GPU computation completed! Processed {} values", result.len());
-    result
+    info!("🎉 GPU computation completed for {} values", result.len());
+    Ok(result)
 }
 
 // Byte-processing WASM function: convert an RGBA frame to grayscale in-place
@@ -239,8 +270,6 @@ pub fn grayscale_frame_rgba(mut input: Vec<u8>, _meta: JsValue) -> Vec<u8> {
 // WASM function to fetch multiple URLs and extract their titles
 #[wasm_bindgen]
 pub async fn fetch_url_title(url_bytes: Vec<u8>, _meta: JsValue) -> Vec<u8> {
-    use wasm_bindgen_futures::JsFuture;
-    use web_sys::{Request, RequestInit, RequestMode, Response};
     use log::info;
     console_log::init_with_level(log::Level::Info).ok();
 
@@ -264,45 +293,42 @@ pub async fn fetch_url_title(url_bytes: Vec<u8>, _meta: JsValue) -> Vec<u8> {
     let url_count = urls.len();
     info!("🌐 Fetching batch of {} URLs", url_count);
 
-    // Fetch all URLs in parallel using futures
     #[derive(serde::Serialize)]
     struct UrlTitleResult {
         url: String,
         title: String,
     }
-    
-    // Create futures for all URL fetches - fetch in parallel
+
     use futures::future;
-    let fetch_futures: Vec<_> = urls.iter().enumerate().map(|(idx, url_str)| {
-        let url = url_str.clone();
-        async move {
-            info!("   🔄 [{}/{}] Starting fetch: {}", idx + 1, url_count, url);
-            let title = match fetch_single_url(&url).await {
-                Ok(t) => {
-                    info!("   ✅ [{}/{}] Success: {} -> {}", idx + 1, url_count, url, t);
-                    t
-                }
-                Err(e) => {
-                    info!("   ⚠️ [{}/{}] Error: {} -> {}", idx + 1, url_count, url, e);
-                    format!("ERROR: {}", e)
-                }
-            };
-            UrlTitleResult {
-                url,
-                title,
+    let fetch_futures: Vec<_> = urls
+        .iter()
+        .enumerate()
+        .map(|(idx, url_str)| {
+            let url = url_str.clone();
+            async move {
+                info!("   🔄 [{}/{}] Starting fetch: {}", idx + 1, url_count, url);
+                let title = match fetch_single_url(&url).await {
+                    Ok(t) => {
+                        info!("   ✅ [{}/{}] Success: {} -> {}", idx + 1, url_count, url, t);
+                        t
+                    }
+                    Err(e) => {
+                        info!("   ⚠️ [{}/{}] Error: {} -> {}", idx + 1, url_count, url, e);
+                        format!("ERROR: {}", e)
+                    }
+                };
+                UrlTitleResult { url, title }
             }
-        }
-    }).collect();
-    
+        })
+        .collect();
+
     info!("   ⏳ Awaiting {} parallel fetches...", fetch_futures.len());
-    
-    // Execute all fetches in parallel
+
     let results: Vec<UrlTitleResult> = future::join_all(fetch_futures).await;
 
-    // Convert results to JSON array
     let results_json = serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
     info!("✅ Completed batch: {} URLs processed", results.len());
-    
+
     results_json.into_bytes()
 }
 
@@ -327,13 +353,12 @@ fn url_encode(s: &str) -> String {
 async fn fetch_single_url(url_str: &str) -> Result<String, String> {
     use wasm_bindgen_futures::JsFuture;
     use web_sys::{Request, RequestInit, RequestMode, Response};
-    use log::info;
 
     // Use local CORS proxy to bypass browser CORS restrictions
     // Make sure proxy-server.js is running on port 3001
     let encoded_url = url_encode(url_str);
     let fetch_url = format!("http://localhost:3001/proxy?url={}", encoded_url);
-    
+
     // Create a fetch request
     let mut opts = RequestInit::new();
     opts.method("GET");
@@ -345,20 +370,22 @@ async fn fetch_single_url(url_str: &str) -> Result<String, String> {
     // Fetch the URL
     let window = web_sys::window().expect("no global `window` exists");
     let fetch_promise = window.fetch_with_request(&request);
-    
+
     // Handle fetch errors (likely CORS)
     let response = match JsFuture::from(fetch_promise).await {
         Ok(resp) => resp,
         Err(e) => {
-            // Check if it's a CORS error
             let error_msg = format!("{:?}", e);
             if error_msg.contains("Failed to fetch") || error_msg.contains("CORS") {
-                return Err(format!("CORS blocked: Browser security prevents fetching this URL. Consider using a CORS proxy or server-side fetching."));
+                return Err(
+                    "CORS blocked: Browser security prevents fetching this URL. Consider using a CORS proxy or server-side fetching."
+                        .to_string(),
+                );
             }
             return Err(format!("Fetch failed: {:?}", e));
         }
     };
-    
+
     let resp: Response = response.dyn_into().unwrap();
     if !resp.ok() {
         return Err(format!("HTTP {}", resp.status()));
@@ -366,9 +393,10 @@ async fn fetch_single_url(url_str: &str) -> Result<String, String> {
 
     // Get the response text
     let text_promise = resp.text().unwrap();
-    let text = JsFuture::from(text_promise).await
+    let text = JsFuture::from(text_promise)
+        .await
         .map_err(|e| format!("Failed to read response: {:?}", e))?;
-    
+
     let text_str: String = text.as_string().unwrap_or_default();
 
     // Extract title from HTML
@@ -380,7 +408,7 @@ async fn fetch_single_url(url_str: &str) -> Result<String, String> {
 fn extract_title_from_html(html: &str) -> String {
     // Look for <title> tag (case-insensitive)
     let html_lower = html.to_lowercase();
-    
+
     // Find <title> tag
     if let Some(title_start) = html_lower.find("<title>") {
         let title_content_start = title_start + 7; // length of "<title>"
@@ -397,7 +425,7 @@ fn extract_title_from_html(html: &str) -> String {
             return title.to_string();
         }
     }
-    
+
     // Fallback: try to find title in meta tags
     if let Some(meta_start) = html_lower.find("property=\"og:title\"") {
         if let Some(content_start) = html[meta_start..].find("content=\"") {
@@ -408,6 +436,6 @@ fn extract_title_from_html(html: &str) -> String {
             }
         }
     }
-    
+
     "NO TITLE FOUND".to_string()
 }
