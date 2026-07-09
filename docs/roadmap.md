@@ -1,31 +1,33 @@
 # Roadmap
 
-Ordered by priority. Items marked (bug) affect correctness today.
+Ordered by priority. Items marked (bug) affect correctness.
+
+Phase 1 (July 2026) landed the binary framed protocol, the unified byte pipeline, ordered results with an explicit missing-chunk policy, and the fault-tolerance fixes below.
 
 ## P0: one runtime that generalizes to any task
 
-- [ ] Unify the numeric and byte task paths into a single byte-based path; numeric jobs become an encoder/decoder pair. Remove `ExecutionMode` from the core (CPU vs GPU is a property of the WASM function, not the framework).
-- [ ] Make the worker a pure dispatcher: call `wasmModule[map_function](bytes, meta)` uniformly; remove special-cased function names and move output encoding decisions (e.g. PNG) into the job spec.
-- [ ] Stop hardcoding the WASM artifact: accept a prebuilt module path (or crate directory) per job, cache modules on workers by content hash, and let workers request a module they are missing. New task types then become new crates, with no framework changes.
+- [x] Unify the numeric and byte task paths into a single byte-based path; numeric jobs are now an encoder/decoder over the general pipeline. `ExecutionMode` no longer selects function names.
+- [x] Make the worker a pure dispatcher: `wasmModule[map_function](bytes, meta)` uniformly; function-name special cases and worker-side PNG encoding removed (output encoding is app-side now).
+- [ ] Stop hardcoding the WASM artifact: accept a prebuilt module path (or crate directory) per job, cache modules on workers by content hash, and let workers request a module they are missing. New task types then become new crates, with no framework changes. (Interim: modules are cached per job id and re-sent on demand.)
 
 ## P1: correctness and performance
 
-- [ ] (bug) Byte-path worker errors arrive as `{ result_b64: "", error }` and are currently collected as successes. Parse the error field, treat as failure, reassign.
-- [ ] (bug) Numeric results concatenate in arrival order and partial results are silently accepted. Attach chunk indices at the framework level, reassemble in order, and make missing-chunk policy explicit.
-- [ ] (bug) A reassigned task can reach a worker that never received the WASM module (module travels only with each worker's first task).
-- [ ] (bug) Tasks on a connected-but-stuck worker are never reassigned; retry-exhausted tasks are never dropped from pending; failed workers are never rehabilitated.
-- [ ] Chunk worker-to-master results the same way master-to-worker tasks are chunked (large PNG results can exceed data-channel message limits). A working implementation exists on the WebApp `result-chunking` branch.
+- [x] (bug) Byte-path worker errors are structured error results; the master treats them as failures and reassigns instead of collecting empty payloads.
+- [x] (bug) Results carry framework-level chunk indices and are reassembled in order; missing chunks follow an explicit `MissingChunkPolicy` (`Fail` default, `AllowPartial` opt-in).
+- [x] (bug) A reassigned task reaches its new worker with the WASM module included when that worker does not have it; a worker-side module-miss heals by re-sending with the module.
+- [x] (bug) Tasks on a connected-but-stuck worker are reassigned on timeout (first result wins, duplicates deduplicated); retry-exhausted chunks are dropped from pending and counted as missing; failed workers are rehabilitated after a cooldown.
+- [x] Results are chunked worker-to-master exactly like tasks master-to-worker (framed transfers both directions). Supersedes the WebApp `result-chunking` branch.
+- [x] Binary data-channel frames (raw bytes, no base64) with bufferedAmount backpressure on both sides.
 - [ ] Replace fixed discovery sleeps (3s + 5s) with event-driven readiness; dispatch as soon as N channels are open.
 - [ ] Pull-based scheduling: keep a task queue and send the next chunk when a worker returns a result, instead of assigning everything upfront.
-- [ ] Binary data-channel frames (header + raw bytes) instead of JSON with double base64; backpressure via bufferedAmount instead of fixed sleeps.
 
 ## P2: hygiene
 
-- [ ] Configurable signaling URL, proxy URL, and STUN/TURN servers (currently localhost-only).
+- [ ] Configurable proxy URL and STUN/TURN servers (signaling URL now reads `WASMHIVE_SIGNALING_URL`; the rest is still hardcoded).
 - [ ] Workers should only dial masters (peer list should carry roles); masters should not treat every peer as a worker.
 - [ ] Use or remove the server's fair-share allocation broadcasts (currently informational only).
 - [ ] Execute WASM in a Web Worker so heavy tasks do not freeze the tab; one Web Worker per core.
-- [ ] Remove dead code: legacy `execute_map_reduce` path, old message formats in the worker, duplicate helpers.
-- [ ] Fix the GPU demo shader (currently doubles instead of squares) and make `cpu_map` non-trivial.
-- [ ] Tests: unit tests for chunkers/reducers, one headless-browser integration test.
+- [x] Remove dead code: legacy float task path, old message formats in the worker, duplicate helpers, base64 helpers.
+- [x] Fix the GPU demo shader (squares now, matching cpu_map) and give gpu_map an in-module CPU fallback when WebGPU is unavailable.
+- [ ] Tests: protocol unit tests exist; add chunker/reducer tests and a headless-browser integration test in CI.
 - [ ] Security notes: authenticated master registration, proxy allowlist.

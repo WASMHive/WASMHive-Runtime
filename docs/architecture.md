@@ -13,26 +13,34 @@ WASMHive is a master-worker map-reduce system where workers are browser tabs. Th
 5. The worker imports the JS glue from a blob URL, instantiates the WASM module, calls the named function on the decoded payload, and returns the result (PNG-encoded for image frames) over the data channel.
 6. The master tracks pending tasks, retries and reassigns on timeout or worker failure, collects results, and applies the reducer locally.
 
-## Wire protocol (current)
+## Wire protocol (binary, v1)
 
-- Signaling: `welcome`, `peerList`, `registerMaster` / `registerWorker`, `offer` / `answer` / `candidate`, `allocation` (fair-share info, informational).
-- Tasks (numeric): `{ task_id, wasm_module, js_glue, data_chunk: [f32], map_function }`.
-- Tasks (bytes): `{ task_id, wasm_module, js_glue, data_chunk_b64, map_function, meta }`.
-- Chunked transport: `{ chunk_id, chunk_index, total_chunks, data }`.
-- Results: `{ task_id, result: [f32], worker_id }` or `{ task_id, result_b64, worker_id, meta }`.
+Signaling stays JSON over WebSocket: `welcome`, `peerList`, `registerMaster` / `registerWorker`, `offer` / `answer` / `candidate`, `allocation` (fair-share info, informational).
+
+Everything on the data channel is a binary frame (see `distribute_runtime/src/protocol.rs`, mirrored in the WebApp worker):
+
+```text
+[magic 0xA5][version][ftype][reserved]
+[id_len u16 LE][transfer id][frame_seq u32 LE][total_frames u32 LE]
+[payload_len u32 LE][payload]
+```
+
+Frames of one transfer (max 60KB payload each) reassemble into a payload; sends are paced by bufferedAmount backpressure on both sides.
+
+- Task payload: `[u32 header_len][header json][u32 wasm_len][wasm][u32 glue_len][glue][u32 input_len][input]` where the header is `{ job_id, task_id, chunk_index, map_function, meta }`. The module and glue travel only in the first task per worker per job; workers cache the loaded module by job id.
+- Result payload: `[u32 header_len][header json][body]` where the header is `{ task_id, chunk_index, worker_id, error?, meta }`. An `error` marks the task failed and triggers reassignment; the body carries raw result bytes otherwise.
+
+The worker is a pure dispatcher: it calls `wasmModule[map_function](input_bytes, meta)` (sync or async) and returns whatever bytes come back. All task-specific interpretation lives in the app-side encoder/decoder and the WASM module itself.
 
 ## Fault tolerance
 
-Pending tasks carry a sent-at timestamp and retry count. A background check reassigns tasks whose worker's channel dropped, and numeric-path empty results are treated as failures and reassigned. Workers whose connection state degrades are marked failed and excluded from scheduling.
+Pending tasks carry a sent-at timestamp and retry count. Tasks that exceed the per-task timeout are reassigned to another worker whether or not the original channel is still open (first result wins; duplicates are dropped by task id). Structured worker errors reassign immediately; a module-miss error re-sends with the module included and is not held against the worker. Workers accumulate strikes for timeouts and failures, are excluded after three, and are rehabilitated after a cooldown if their channel is still open. Chunks that exhaust retries follow the job's `MissingChunkPolicy`: `Fail` errors the job, `AllowPartial` returns the rest in order and reports what was dropped.
 
 ## Known limitations
 
 These are tracked in the roadmap:
 
-- Two parallel task paths (numeric and bytes) instead of one general path.
-- The worker dispatcher special-cases certain function names instead of being fully generic.
 - The WASM artifact location and crate are fixed (`examples` crate) rather than supplied per job.
 - Static round-robin assignment; no pull-based scheduling for stragglers.
 - Fixed discovery sleeps instead of event-driven readiness, which also inflates benchmark latency by ~8s per job.
-- Results return as a single data-channel message, which limits maximum result size.
-- Byte-path worker errors are not yet distinguished from empty successful results.
+- WASM executes on the worker tab's main thread.
