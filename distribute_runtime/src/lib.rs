@@ -1,7 +1,7 @@
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::process::Command;
 use std::sync::Arc;
@@ -9,13 +9,21 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use webrtc::api::APIBuilder;
-use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+
+pub mod protocol;
+use protocol::{
+    decode_frame, decode_result_payload, encode_task_payload, split_into_frames, Reassembler,
+    TaskHeader, FRAME_RESULT, FRAME_TASK,
+};
+
+pub type DistributeError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub enum ExecutionMode {
@@ -23,371 +31,66 @@ pub enum ExecutionMode {
     GPU,
 }
 
-// WebSocket signaling messages
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type")]
-enum SignalingMessage {
-    #[serde(rename = "welcome")]
-    Welcome {
-        id: String,
-        peers: Option<Vec<String>>,
-    },
-    #[serde(rename = "peerList")]
-    PeerList { peers: Vec<String> },
-    #[serde(rename = "offer")]
-    Offer {
-        from: String,
-        to: String,
-        offer: serde_json::Value,
-    },
-    #[serde(rename = "answer")]
-    Answer {
-        from: String,
-        to: String,
-        answer: serde_json::Value,
-    },
-    #[serde(rename = "candidate")]
-    Candidate {
-        from: String,
-        to: String,
-        candidate: serde_json::Value,
-    },
+/// What to do when some chunks never produce a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingChunkPolicy {
+    /// Fail the whole job (default). A partial sum is a wrong sum.
+    Fail,
+    /// Return the results that did arrive, in chunk order, and log what was dropped.
+    AllowPartial,
 }
 
-// Compute task message
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct ComputeTask {
+#[derive(Debug, Clone)]
+pub struct JobOptions {
+    pub missing_chunks: MissingChunkPolicy,
+    /// Per-task timeout before the task is reassigned to another worker.
+    pub task_timeout_secs: u64,
+    /// How many times a chunk may be reassigned before it counts as missing.
+    pub max_retries: u32,
+}
+
+impl Default for JobOptions {
+    fn default() -> Self {
+        Self {
+            missing_chunks: MissingChunkPolicy::Fail,
+            task_timeout_secs: 30,
+            max_retries: 3,
+        }
+    }
+}
+
+/// A completed worker result delivered from the data-channel handler.
+#[derive(Debug)]
+struct WorkerResultMsg {
     task_id: String,
-    wasm_module: String, // base64 encoded WASM
-    js_glue: String,
-    data_chunk: Vec<f32>,
-    map_function: String, // "cpu_map" or "gpu_map"
-}
-
-// Byte-oriented compute task (for arbitrary binary payloads like video frames)
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct ComputeTaskBytes {
-    task_id: String,
-    wasm_module: String, // base64 encoded WASM
-    js_glue: String,
-    data_chunk_b64: String, // base64-encoded bytes
-    map_function: String,   // e.g., "grayscale_frame"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    meta: Option<serde_json::Value>, // optional metadata (e.g., frame_index, width, height)
-}
-
-// Chunk message for large data transfers
-#[derive(Serialize, Deserialize, Debug)]
-struct ChunkMessage {
-    chunk_id: String,      // Unique ID for this chunked message
-    chunk_index: usize,    // Index of this chunk (0-based)
-    total_chunks: usize,   // Total number of chunks
-    data: String,          // Base64 encoded chunk data
-}
-
-// Compute result message
-#[derive(Serialize, Deserialize, Debug)]
-struct ComputeResult {
-    task_id: String,
-    result: Vec<f32>,
+    chunk_index: u32,
     worker_id: String,
+    error: Option<String>,
+    meta: serde_json::Value,
+    bytes: Vec<u8>,
 }
 
-// Variant result type to support both numeric and binary results
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(untagged)]
-enum WorkerResult {
-    Floats { task_id: String, result: Vec<f32>, worker_id: String },
-    Bytes { task_id: String, result_b64: String, worker_id: String, #[serde(default)] meta: Option<serde_json::Value> },
-}
-
-// Task tracking for fault tolerance
+/// A task in flight, kept so it can be re-sent to another worker.
 #[derive(Debug, Clone)]
 struct PendingTask {
-    task_id: String,
+    chunk_index: u32,
     worker_id: String,
-    task: ComputeTask,
     sent_at: std::time::Instant,
     retry_count: u32,
 }
 
-#[derive(Debug, Clone)]
-struct PendingTaskBytes {
-    task_id: String,
-    worker_id: String,
-    task: ComputeTaskBytes,
-    sent_at: std::time::Instant,
-    retry_count: u32,
-}
+const BUFFERED_HIGH_WATER: usize = 4 * 1024 * 1024;
+const WORKER_REHAB_SECS: u64 = 60;
+const WORKER_STRIKE_LIMIT: u32 = 3;
 
-// Helper struct for parsing test data
-#[derive(Serialize, Deserialize)]
-struct TestDataForCalculation {
-    numbers: Vec<f32>,
-}
-
-pub trait ComputeFunction<Input, Output> {
-    fn call(&self, input: Input) -> Output;
-}
-
-impl<F, Input, Output> ComputeFunction<Input, Output> for F
-where
-    F: Fn(Input) -> Output,
-{
-    fn call(&self, input: Input) -> Output {
-        self(input)
-    }
-}
-
-pub async fn run_distributed_impl_with_code<F, Input, Output, ChunkFn, ReduceFn>(
-    _compute_fn: F,
-    input: Input,
-    chunker: ChunkFn,
-    reducer: ReduceFn,
-    execution_mode: ExecutionMode,
-    _function_body: &str,
-    fn_name: &str,
-) -> Output
-where
-    F: ComputeFunction<Input, Output> + Send + Sync + 'static,
-    Input: Serialize + for<'de> Deserialize<'de> + Clone + Send + 'static,
-    Output: Serialize + for<'de> Deserialize<'de> + Send + 'static,
-    ChunkFn: Fn(&Input) -> Vec<Input> + Send + Sync,
-    ReduceFn: Fn(Vec<Output>) -> Output + Send + Sync,
-{
-    println!("🌐 Executing distributed map-reduce using examples WASM...");
-
-    // Compile WASM from examples directory
-    match compile_examples_to_wasm(fn_name).await {
-        Ok((wasm_bytes, js_glue)) => {
-            println!(
-                "📦 Successfully compiled examples to WASM ({} bytes)",
-                wasm_bytes.len()
-            );
-
-            // Use provided chunker to split input into chunks consumable by the WASM module
-            let input_chunks: Vec<Input> = chunker(&input);
-
-            // Convert chunks into Vec<f32> that workers expect (best-effort extraction)
-            fn extract_numbers_from_value(value: &serde_json::Value) -> Option<Vec<f32>> {
-                if let Some(arr) = value.as_array() {
-                    let mut out = Vec::with_capacity(arr.len());
-                    for v in arr {
-                        if let Some(n) = v.as_f64() {
-                            out.push(n as f32);
-                        } else {
-                            return None;
-                        }
-                    }
-                    return Some(out);
-                }
-                if let Some(obj) = value.as_object() {
-                    if let Some(numbers) = obj.get("numbers") {
-                        return extract_numbers_from_value(numbers);
-                    }
-                }
-                None
-            }
-
-            let mut data_chunks: Vec<Vec<f32>> = Vec::new();
-            for chunk in input_chunks.iter() {
-                match serde_json::to_value(chunk) {
-                    Ok(val) => {
-                        if let Some(nums) = extract_numbers_from_value(&val) {
-                            data_chunks.push(nums);
-                        } else {
-                            println!("⚠️ Chunk could not be converted into Vec<f32>; skipping chunk: {:?}", val);
-                        }
-                    }
-                    Err(e) => {
-                        println!("⚠️ Failed to serialize chunk; skipping. Error: {}", e);
-                    }
-                }
-            }
-
-            if data_chunks.is_empty() {
-                println!("⚠️ No usable chunks produced by chunker; returning reducer on empty set");
-                return reducer(Vec::new());
-            }
-
-            // Execute distributed map using precomputed chunks and collect mapped values
-            let mapped_values_json = execute_distributed_map_reduce_with_chunks(
-                data_chunks,
-                &execution_mode,
-                &wasm_bytes,
-                &js_glue,
-                fn_name,
-            )
-            .await;
-
-            // Parse collected mapped values (floats) and convert to Output, then apply reducer
-            match serde_json::from_str::<Vec<f32>>(&mapped_values_json) {
-                Ok(float_values) => {
-                    let mut converted: Vec<Output> = Vec::with_capacity(float_values.len());
-                    for v in float_values {
-                        // Try direct conversion from float
-                        let direct: Result<Output, _> = serde_json::from_value(serde_json::Value::from(v));
-                        if let Ok(o) = direct {
-                            converted.push(o);
-                            continue;
-                        }
-
-                        // Try common wrapper {"value": v}
-                        let wrapped = serde_json::json!({"value": v});
-                        match serde_json::from_value::<Output>(wrapped) {
-                            Ok(o) => converted.push(o),
-                            Err(_) => {
-                                println!("⚠️ Unable to convert mapped float {} into Output; skipping", v);
-                            }
-                        }
-                    }
-                    reducer(converted)
-                }
-                Err(e) => {
-                    println!("⚠️ Failed to parse collected mapped values as floats: {}", e);
-                    reducer(Vec::new())
-                }
-            }
-        }
-        Err(e) => {
-            println!("⚠️ WASM compilation failed: {}", e);
-            // Return a default result
-            reducer(Vec::new())
-        }
-    }
-}
-
-async fn compile_examples_to_wasm(
-    _fn_name: &str,
-) -> Result<(Vec<u8>, String), Box<dyn std::error::Error>> {
-    println!("🔧 Compiling examples to WASM for distributed execution...");
-
-    // Resolve the examples directory robustly
-    use std::path::PathBuf;
-    let current_dir = std::env::current_dir()?;
-    // Allow override via env
-    if let Ok(override_dir) = std::env::var("W3DGE_WASM_EXAMPLES_DIR") {
-        let p = PathBuf::from(override_dir);
-        if p.exists() {
-            println!("📁 Using examples directory (env): {}", p.display());
-            // proceed with p
-            // Compile using wasm-pack
-            let output = Command::new("wasm-pack")
-                .args(&["build", "--target", "web", "--out-dir", "pkg"])
-                .current_dir(&p)
-                .output()?;
-            if !output.status.success() {
-                let error_msg = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("WASM compilation failed: {}", error_msg).into());
-            }
-            let wasm_file_path = p.join("pkg").join("distributed_examples_bg.wasm");
-            let js_file_path = p.join("pkg").join("distributed_examples.js");
-            let wasm_bytes = fs::read(&wasm_file_path)?;
-            let js_glue = fs::read_to_string(&js_file_path)?;
-            println!("📦 WASM module size: {} bytes", wasm_bytes.len());
-            println!("📜 JS glue size: {} bytes", js_glue.len());
-            return Ok((wasm_bytes, js_glue));
-        }
-    }
-
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir.parent().unwrap_or(&manifest_dir);
-
-    let candidates = [
-        current_dir.clone(),
-        current_dir.join("examples"),
-        current_dir.parent().unwrap_or(&current_dir).join("examples"),
-        repo_root.join("examples"),
-    ];
-
-    let examples_dir = candidates
-        .iter()
-        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("examples") && p.exists())
-        .cloned()
-        .ok_or_else(|| format!(
-            "Unable to locate examples directory. Tried: {}",
-            candidates
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))?;
-
-    println!("📁 Using examples directory: {}", examples_dir.display());
-
-    // Compile using wasm-pack
-    let output = Command::new("wasm-pack")
-        .args(&["build", "--target", "web", "--out-dir", "pkg"])
-        .current_dir(&examples_dir)
-        .output()?;
-
-    if !output.status.success() {
-        let error_msg = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("WASM compilation failed: {}", error_msg).into());
-    }
-
-    println!("✅ WASM compilation successful");
-
-    // Read the compiled WASM file and JS glue
-    let wasm_file_path = examples_dir
-        .join("pkg")
-        .join("distributed_examples_bg.wasm");
-    let js_file_path = examples_dir.join("pkg").join("distributed_examples.js");
-
-    let wasm_bytes = fs::read(&wasm_file_path)?;
-    let js_glue = fs::read_to_string(&js_file_path)?;
-
-    println!("📦 WASM module size: {} bytes", wasm_bytes.len());
-    println!("📜 JS glue size: {} bytes", js_glue.len());
-
-    Ok((wasm_bytes, js_glue))
-}
-
-async fn execute_distributed_map_reduce_with_chunks(
-    data_chunks: Vec<Vec<f32>>,
-    execution_mode: &ExecutionMode,
-    wasm_bytes: &[u8],
-    js_glue: &str,
-    _fn_name: &str,
-) -> String {
-    println!("🌐 Starting distributed map execution with precomputed chunks...");
-
-    let mut distributor = match DistributedCompute::new().await {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Failed to create distributed compute: {}", e);
-            return String::from("[]");
-        }
-    };
-
-    match distributor
-        .execute_map_with_chunks(data_chunks, execution_mode, wasm_bytes, js_glue)
-        .await
-    {
-        Ok(collected_values) => match serde_json::to_string(&collected_values) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Failed to serialize collected values: {}", e);
-                String::from("[]")
-            }
-        },
-        Err(e) => {
-            eprintln!("Distributed map execution failed: {}", e);
-            String::from("[]")
-        }
-    }
-}
-
-// Distributed compute structure for managing WebRTC connections to workers
 pub struct DistributedCompute {
     ws_url: String,
     my_id: Option<String>,
     workers: Arc<Mutex<Vec<String>>>,
     peer_connections: Arc<Mutex<HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>>>>,
     data_channels: Arc<Mutex<HashMap<String, Arc<RTCDataChannel>>>>,
-    result_receiver: Option<mpsc::Receiver<WorkerResult>>,
-    result_sender: mpsc::Sender<WorkerResult>,
-    is_connected: bool,
+    result_receiver: Option<mpsc::Receiver<WorkerResultMsg>>,
+    result_sender: mpsc::Sender<WorkerResultMsg>,
     ws_sender: Option<
         Arc<
             Mutex<
@@ -400,998 +103,464 @@ pub struct DistributedCompute {
             >,
         >,
     >,
-    // Fault tolerance: track pending tasks
-    pending_tasks: Arc<Mutex<HashMap<String, PendingTask>>>,
-    pending_tasks_bytes: Arc<Mutex<HashMap<String, PendingTaskBytes>>>,
-    // Track failed workers
     failed_workers: Arc<Mutex<HashMap<String, std::time::Instant>>>,
 }
 
 impl DistributedCompute {
-    async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let (result_sender, result_receiver) = mpsc::channel(100);
-
+    async fn new() -> Result<Self, DistributeError> {
+        let (result_sender, result_receiver) = mpsc::channel(256);
         Ok(Self {
-            ws_url: "ws://localhost:3000".to_string(),
+            ws_url: std::env::var("WASMHIVE_SIGNALING_URL")
+                .unwrap_or_else(|_| "ws://localhost:3000".to_string()),
             my_id: None,
             workers: Arc::new(Mutex::new(Vec::new())),
             peer_connections: Arc::new(Mutex::new(HashMap::new())),
             data_channels: Arc::new(Mutex::new(HashMap::new())),
             result_receiver: Some(result_receiver),
             result_sender,
-            is_connected: false,
             ws_sender: None,
-            pending_tasks: Arc::new(Mutex::new(HashMap::new())),
-            pending_tasks_bytes: Arc::new(Mutex::new(HashMap::new())),
             failed_workers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    // Helper function to send message with automatic chunking if needed
-    async fn send_message_chunked(
+    /// Send pre-encoded frames over a channel with backpressure.
+    async fn send_frames(
         channel: &Arc<RTCDataChannel>,
-        message: &str,
-        chunk_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        const MAX_CHUNK_SIZE: usize = 30_000; // 30KB chunks (after base64 encoding + JSON overhead will be ~40KB)
-
-        if message.len() <= MAX_CHUNK_SIZE {
-            // Message is small enough, send directly
-            channel.send_text(message).await?;
-            println!("   📤 Sent message directly ({} bytes)", message.len());
-            return Ok(());
+        frames: &[Vec<u8>],
+    ) -> Result<(), DistributeError> {
+        for frame in frames {
+            while channel.buffered_amount().await > BUFFERED_HIGH_WATER {
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            }
+            channel.send(&Bytes::from(frame.clone())).await?;
         }
-
-        // Message is too large, split into chunks
-        let message_bytes = message.as_bytes();
-        let total_chunks = (message_bytes.len() + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE;
-
-        println!(
-            "   📦 Splitting large message into {} chunks ({} bytes total)",
-            total_chunks,
-            message_bytes.len()
-        );
-
-        for chunk_index in 0..total_chunks {
-            let start = chunk_index * MAX_CHUNK_SIZE;
-            let end = (start + MAX_CHUNK_SIZE).min(message_bytes.len());
-            let chunk_data = &message_bytes[start..end];
-
-            // Encode chunk as base64
-            let chunk_b64 = BASE64.encode(chunk_data);
-
-            let chunk_message = ChunkMessage {
-                chunk_id: chunk_id.to_string(),
-                chunk_index,
-                total_chunks,
-                data: chunk_b64,
-            };
-
-            let chunk_json = serde_json::to_string(&chunk_message)?;
-            channel.send_text(&chunk_json).await?;
-
-            println!(
-                "   📤 Sent chunk {}/{} ({} bytes)",
-                chunk_index + 1,
-                total_chunks,
-                chunk_data.len()
-            );
-
-            // Small delay between chunks to avoid overwhelming the channel
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        }
-
         Ok(())
     }
 
-    // Fault tolerance: Check if a worker is available and healthy
-    async fn is_worker_available(&self, worker_id: &str) -> bool {
-        let data_channels = self.data_channels.lock().await;
-        if let Some(channel) = data_channels.get(worker_id) {
-            // Check if channel is open
-            matches!(channel.ready_state(), RTCDataChannelState::Open)
-        } else {
-            false
-        }
-    }
-
-    // Fault tolerance: Get available workers (excluding failed ones)
+    /// Workers with an open data channel, excluding recently failed ones.
+    /// A failed worker whose channel is still open is rehabilitated after a cooldown.
     async fn get_available_workers(&self) -> Vec<String> {
         let data_channels = self.data_channels.lock().await;
-        let failed_workers = self.failed_workers.lock().await;
-        
+        let mut failed = self.failed_workers.lock().await;
+        let now = std::time::Instant::now();
+        failed.retain(|worker_id, since| {
+            let channel_open = data_channels
+                .get(worker_id)
+                .map(|c| matches!(c.ready_state(), RTCDataChannelState::Open))
+                .unwrap_or(false);
+            !(channel_open && now.duration_since(*since).as_secs() >= WORKER_REHAB_SECS)
+        });
         data_channels
             .iter()
             .filter(|(worker_id, channel)| {
-                // Check if worker is not marked as failed and channel is open
-                !failed_workers.contains_key(*worker_id) &&
-                matches!(channel.ready_state(), RTCDataChannelState::Open)
+                !failed.contains_key(*worker_id)
+                    && matches!(channel.ready_state(), RTCDataChannelState::Open)
             })
             .map(|(worker_id, _)| worker_id.clone())
             .collect()
     }
 
-    // Fault tolerance: Mark a worker as failed
     async fn mark_worker_failed(&self, worker_id: &str) {
-        let mut failed_workers = self.failed_workers.lock().await;
-        failed_workers.insert(worker_id.to_string(), std::time::Instant::now());
+        let mut failed = self.failed_workers.lock().await;
+        failed.insert(worker_id.to_string(), std::time::Instant::now());
         println!("⚠️  Marked worker {} as failed", worker_id);
     }
 
-    // Fault tolerance: Reassign a failed task to a new worker
-    async fn reassign_task(
+    /// Build and send one task to one worker. The WASM module and glue are
+    /// included only when the worker has not received them for this job yet.
+    async fn send_task(
         &self,
-        pending_task: &PendingTask,
-        available_workers: &[String],
-    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-        if available_workers.is_empty() {
-            return Err("No available workers for reassignment".into());
-        }
-
-        // Find a worker that's not the failed one
-        let new_worker = available_workers
-            .iter()
-            .find(|&w| w != &pending_task.worker_id)
-            .or_else(|| available_workers.first())
-            .ok_or("No suitable worker found")?;
-
-        let data_channels = self.data_channels.lock().await;
-        if let Some(channel) = data_channels.get(new_worker) {
-            let task_json = serde_json::to_string(&pending_task.task)?;
-            match Self::send_message_chunked(channel, &task_json, &pending_task.task.task_id).await {
-                Ok(_) => {
-                    println!(
-                        "   🔄 Reassigned task {} from {} to {} (retry {})",
-                        pending_task.task.task_id,
-                        pending_task.worker_id,
-                        new_worker,
-                        pending_task.retry_count + 1
-                    );
-                    Ok(Some(new_worker.clone()))
-                }
-                Err(e) => {
-                    println!("   ❌ Failed to reassign task to {}: {}", new_worker, e);
-                    Err(e)
-                }
-            }
-        } else {
-            Err(format!("No data channel for worker: {}", new_worker).into())
-        }
-    }
-
-    // Fault tolerance: Reassign a failed byte task to a new worker
-    async fn reassign_task_bytes(
-        &self,
-        pending_task: &PendingTaskBytes,
-        available_workers: &[String],
-    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-        if available_workers.is_empty() {
-            return Err("No available workers for reassignment".into());
-        }
-
-        let new_worker = available_workers
-            .iter()
-            .find(|&w| w != &pending_task.worker_id)
-            .or_else(|| available_workers.first())
-            .ok_or("No suitable worker found")?;
-
-        let data_channels = self.data_channels.lock().await;
-        if let Some(channel) = data_channels.get(new_worker) {
-            let task_json = serde_json::to_string(&pending_task.task)?;
-            match Self::send_message_chunked(channel, &task_json, &pending_task.task.task_id).await {
-                Ok(_) => {
-                    println!(
-                        "   🔄 Reassigned byte task {} from {} to {} (retry {})",
-                        pending_task.task.task_id,
-                        pending_task.worker_id,
-                        new_worker,
-                        pending_task.retry_count + 1
-                    );
-                    Ok(Some(new_worker.clone()))
-                }
-                Err(e) => {
-                    println!("   ❌ Failed to reassign byte task to {}: {}", new_worker, e);
-                    Err(e)
-                }
-            }
-        } else {
-            Err(format!("No data channel for worker: {}", new_worker).into())
-        }
-    }
-
-    // Fault tolerance: Check for and reassign timed-out tasks
-    async fn check_and_reassign_timed_out_tasks(&self) {
-        const TASK_TIMEOUT_SECS: u64 = 30; // 30 seconds timeout
-        const MAX_RETRIES: u32 = 3;
-
-        let available_workers = self.get_available_workers().await;
-        if available_workers.is_empty() {
-            return;
-        }
-
-        // Check float tasks
-        let pending_tasks = self.pending_tasks.lock().await;
-        let now = std::time::Instant::now();
-        let mut to_reassign: Vec<(String, PendingTask)> = Vec::new();
-
-        for (task_id, pending_task) in pending_tasks.iter() {
-            if pending_task.retry_count >= MAX_RETRIES {
-                println!("   ⚠️  Task {} exceeded max retries, marking worker {} as failed", task_id, pending_task.worker_id);
-                self.mark_worker_failed(&pending_task.worker_id).await;
-                continue;
-            }
-
-            if now.duration_since(pending_task.sent_at).as_secs() > TASK_TIMEOUT_SECS {
-                // Check if worker is still available
-                if !self.is_worker_available(&pending_task.worker_id).await {
-                    to_reassign.push((task_id.clone(), pending_task.clone()));
-                }
-            }
-        }
-
-        drop(pending_tasks);
-
-        // Reassign timed-out tasks
-        for (task_id, mut pending_task) in to_reassign {
-            match self.reassign_task(&pending_task, &available_workers).await {
-                Ok(Some(new_worker)) => {
-                    pending_task.worker_id = new_worker;
-                    pending_task.sent_at = std::time::Instant::now();
-                    pending_task.retry_count += 1;
-                    let mut pending_tasks = self.pending_tasks.lock().await;
-                    pending_tasks.insert(task_id, pending_task);
-                }
-                Ok(None) | Err(_) => {
-                    // Mark worker as failed if reassignment fails
-                    self.mark_worker_failed(&pending_task.worker_id).await;
-                }
-            }
-        }
-
-        // Check byte tasks
-        let pending_tasks_bytes = self.pending_tasks_bytes.lock().await;
-        let mut to_reassign_bytes: Vec<(String, PendingTaskBytes)> = Vec::new();
-
-        for (task_id, pending_task) in pending_tasks_bytes.iter() {
-            if pending_task.retry_count >= MAX_RETRIES {
-                println!("   ⚠️  Byte task {} exceeded max retries, marking worker {} as failed", task_id, pending_task.worker_id);
-                self.mark_worker_failed(&pending_task.worker_id).await;
-                continue;
-            }
-
-            if now.duration_since(pending_task.sent_at).as_secs() > TASK_TIMEOUT_SECS {
-                if !self.is_worker_available(&pending_task.worker_id).await {
-                    to_reassign_bytes.push((task_id.clone(), pending_task.clone()));
-                }
-            }
-        }
-
-        drop(pending_tasks_bytes);
-
-        for (task_id, mut pending_task) in to_reassign_bytes {
-            match self.reassign_task_bytes(&pending_task, &available_workers).await {
-                Ok(Some(new_worker)) => {
-                    pending_task.worker_id = new_worker;
-                    pending_task.sent_at = std::time::Instant::now();
-                    pending_task.retry_count += 1;
-                    let mut pending_tasks_bytes = self.pending_tasks_bytes.lock().await;
-                    pending_tasks_bytes.insert(task_id, pending_task);
-                }
-                Ok(None) | Err(_) => {
-                    self.mark_worker_failed(&pending_task.worker_id).await;
-                }
-            }
-        }
-    }
-
-    async fn execute_map_reduce(
-        &mut self,
-        input_json: &str,
-        execution_mode: &ExecutionMode,
-        wasm_bytes: &[u8],
-        js_glue: &str,
-        _fn_name: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // Parse input
-        let input: TestDataForCalculation = serde_json::from_str(input_json)?;
-
-        // Connect to signaling server
-        self.connect_to_signaling_server().await?;
-        self.is_connected = true;
-
-        // Wait for initial worker discovery
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-        let workers_list = {
-            let workers = self.workers.lock().await;
-            workers.clone()
+        worker_id: &str,
+        header: &TaskHeader,
+        input: &[u8],
+        wasm: &[u8],
+        glue: &[u8],
+        workers_with_module: &mut HashSet<String>,
+    ) -> Result<(), DistributeError> {
+        let channel = {
+            let channels = self.data_channels.lock().await;
+            channels
+                .get(worker_id)
+                .cloned()
+                .ok_or_else(|| format!("no data channel for worker {}", worker_id))?
         };
-
-        println!("🔍 Current workers list: {:?}", workers_list);
-
-        if workers_list.is_empty() {
-            return Err("No workers available for computation".into());
+        if !matches!(channel.ready_state(), RTCDataChannelState::Open) {
+            return Err(format!("data channel to {} is not open", worker_id).into());
         }
-
-        // Wait for data channels to be established
-        println!("⏳ Waiting for data channels to be established...");
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-        // Filter workers to only include those with actual data channels
-        let connected_workers = {
-            let data_channels = self.data_channels.lock().await;
-            workers_list
-                .into_iter()
-                .filter(|worker_id| data_channels.contains_key(worker_id))
-                .collect::<Vec<_>>()
+        let include_module = !workers_with_module.contains(worker_id);
+        let payload = if include_module {
+            encode_task_payload(header, wasm, glue, input)
+        } else {
+            encode_task_payload(header, &[], &[], input)
         };
-
-        if connected_workers.is_empty() {
-            return Err("No workers with data channels available for computation".into());
+        let frames = split_into_frames(FRAME_TASK, &header.task_id, &payload);
+        Self::send_frames(&channel, &frames).await?;
+        if include_module {
+            workers_with_module.insert(worker_id.to_string());
         }
-
-        // Distribute work to connected workers
-        let max_chunk_size = 1000; // Conservative limit for WebRTC data channels
-        let desired_chunk_size = input.numbers.len() / connected_workers.len().max(1);
-        let chunk_size = desired_chunk_size.min(max_chunk_size);
-        let mut tasks = Vec::new();
-
-        // Encode WASM as base64
-        let wasm_b64 = BASE64.encode(wasm_bytes);
-
-        for (i, worker_id) in connected_workers.iter().enumerate() {
-            let start_idx = i * chunk_size;
-            let end_idx = if i == connected_workers.len() - 1 {
-                input.numbers.len() // Last worker gets remainder
-            } else {
-                (start_idx + chunk_size).min(input.numbers.len())
-            };
-
-            if start_idx < input.numbers.len() {
-                let data_chunk = input.numbers[start_idx..end_idx].to_vec();
-                let task = ComputeTask {
-                    task_id: format!("task_{}_{}", chrono::Utc::now().timestamp_millis(), i),
-                    wasm_module: wasm_b64.clone(),
-                    js_glue: js_glue.to_string(),
-                    data_chunk,
-                    map_function: match execution_mode {
-                        ExecutionMode::CPU => "cpu_map".to_string(),
-                        ExecutionMode::GPU => "gpu_map".to_string(),
-                    },
-                };
-
-                tasks.push((worker_id.clone(), task));
-            }
-        }
-
-        // Send tasks to workers via WebRTC data channels
-        let mut sent_tasks = 0;
-        println!(
-            "📊 Distributing to {} connected workers: {:?}",
-            connected_workers.len(),
-            connected_workers
-        );
-
-        for (worker_id, task) in &tasks {
-            let data_channels = self.data_channels.lock().await;
-            println!("🔍 Checking data channels. Total: {}, Looking for: {}", data_channels.len(), worker_id);
-            if let Some(channel) = data_channels.get(worker_id) {
-                println!(
-                    "🔍 Attempting to send task to {}, channel state: {:?}",
-                    worker_id,
-                    channel.ready_state()
-                );
-                let task_json = serde_json::to_string(task).unwrap();
-
-                // Use chunked sending for large messages
-                match Self::send_message_chunked(channel, &task_json, &task.task_id).await {
-                    Ok(_) => {
-                        println!(
-                            "   ✅ {} -> {} ({} elements)",
-                            task.task_id,
-                            worker_id,
-                            task.data_chunk.len()
-                        );
-                        sent_tasks += 1;
-                    }
-                    Err(e) => {
-                        println!("   ❌ Failed to send to {}: {}", worker_id, e);
-                    }
-                }
-            } else {
-                println!("   ⚠️  No data channel for worker: {}", worker_id);
-            }
-        }
-
-        // If we successfully sent tasks, wait for results
-        if sent_tasks > 0 {
-            println!("⏳ Waiting for {} results from workers...", sent_tasks);
-
-            // Wait for results with timeout
-            let mut collected_results = Vec::new();
-            let timeout = tokio::time::Duration::from_secs(10);
-            let start_time = tokio::time::Instant::now();
-
-            let mut results_received = 0;
-            while results_received < sent_tasks && start_time.elapsed() < timeout {
-                if let Some(mut receiver) = self.result_receiver.take() {
-                    match tokio::time::timeout(
-                        tokio::time::Duration::from_millis(1000),
-                        receiver.recv(),
-                    )
-                    .await
-                    {
-                        Ok(Some(result_msg)) => {
-                            match result_msg {
-                                WorkerResult::Floats { task_id: _, result, worker_id } => {
-                                    println!(
-                                        "   📥 {} returned {} values: {:?}",
-                                        worker_id,
-                                        result.len(),
-                                        result
-                                    );
-                                    collected_results.extend(result);
-                                    results_received += 1;
-                                }
-                                WorkerResult::Bytes { task_id: _, result_b64: _, worker_id, meta: _ } => {
-                                    println!("   ⚠️ Received bytes result from {} but float results expected; ignoring", worker_id);
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            println!("   ⚠️  Result channel closed");
-                            break; // Channel closed
-                        }
-                        Err(_) => {
-                            println!(
-                                "   ⏱️  Waiting for more results... ({}/{})",
-                                results_received, sent_tasks
-                            );
-                        } // Timeout, continue waiting
-                    }
-                    self.result_receiver = Some(receiver);
-                }
-            }
-
-            if results_received == sent_tasks {
-                // Use local WASM reduce function to combine results
-                let final_result = self.reduce_results_with_wasm(&collected_results).await?;
-                println!(
-                    "✅ All {} workers completed! Distributed result: {}",
-                    sent_tasks, final_result
-                );
-
-                // Disconnect from signaling server after successful job completion
-                self.disconnect_from_signaling_server().await?;
-
-                return Ok(format!(r#"{{"value": {}}}"#, final_result));
-            } else {
-                println!(
-                    "❌ Only {}/{} workers returned results - distributed execution failed",
-                    results_received, sent_tasks
-                );
-            }
-        }
-
-        // Disconnect from signaling server after failed job
-        self.disconnect_from_signaling_server().await?;
-
-        // No fallback - remote execution must work
-        Err("Failed to get results from distributed workers - remote execution required".into())
+        Ok(())
     }
 
-    async fn execute_map_with_chunks(
+    /// Run one job: distribute `chunks` (already encoded to bytes + meta),
+    /// collect results in chunk order, reassigning failed or timed-out tasks.
+    async fn execute_byte_job(
         &mut self,
-        data_chunks: Vec<Vec<f32>>,
-        execution_mode: &ExecutionMode,
-        wasm_bytes: &[u8],
-        js_glue: &str,
-    ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
-        // Connect to signaling server
-        self.connect_to_signaling_server().await?;
-        self.is_connected = true;
-
-        // Wait for initial worker discovery
-        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-        println!("⏳ Waiting for data channels to be established...");
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        
-        // Use available workers (fault tolerance: excludes failed workers)
-        let mut available_workers = self.get_available_workers().await;
-        if available_workers.is_empty() {
-            return Err("No workers with data channels available for computation".into());
-        }
-
-        // Prepare tasks by round-robin assignment of chunks to workers
-        let wasm_b64 = BASE64.encode(wasm_bytes);
-        let mut tasks: Vec<(String, ComputeTask)> = Vec::new();
-        // Track first task per worker to include WASM once (optimization)
-        let mut worker_first_sent: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-        for (i, chunk) in data_chunks.into_iter().enumerate() {
-            let worker_idx = i % available_workers.len();
-            let worker_id = available_workers[worker_idx].clone();
-            // Only send WASM with the first task to each worker
-            let include_wasm = !worker_first_sent.get(&worker_id).copied().unwrap_or(false);
-            let map_function = match execution_mode {
-                ExecutionMode::CPU => "cpu_map".to_string(),
-                ExecutionMode::GPU => "gpu_map".to_string(),
-            };
-            let task = ComputeTask {
-                task_id: format!("task_{}_{}", chrono::Utc::now().timestamp_millis(), i),
-                wasm_module: if include_wasm { wasm_b64.clone() } else { String::new() },
-                js_glue: if include_wasm { js_glue.to_string() } else { String::new() },
-                data_chunk: chunk,
-                map_function,
-            };
-            worker_first_sent.insert(worker_id.clone(), true);
-            tasks.push((worker_id, task));
-        }
-
-        // Clear pending tasks tracking
-        {
-            let mut pending_tasks = self.pending_tasks.lock().await;
-            pending_tasks.clear();
-        }
-
-        // Send tasks and track them
-        let mut sent_tasks = 0usize;
-        println!(
-            "📊 Distributing {} chunks to {} available workers: {:?}",
-            tasks.len(),
-            available_workers.len(),
-            available_workers
-        );
-
-        for (worker_id, task) in &tasks {
-            let data_channels = self.data_channels.lock().await;
-            if let Some(channel) = data_channels.get(worker_id) {
-                println!(
-                    "🔍 Attempting to send task to {}, channel state: ready",
-                    worker_id
-                );
-                let task_json = serde_json::to_string(task).unwrap();
-                match Self::send_message_chunked(channel, &task_json, &task.task_id).await {
-                    Ok(_) => {
-                        println!(
-                            "   ✅ {} -> {} ({} elements)",
-                            task.task_id,
-                            worker_id,
-                            task.data_chunk.len()
-                        );
-                        // Track the task for fault tolerance
-                        let pending_task = PendingTask {
-                            task_id: task.task_id.clone(),
-                            worker_id: worker_id.clone(),
-                            task: task.clone(),
-                            sent_at: std::time::Instant::now(),
-                            retry_count: 0,
-                        };
-                        let mut pending_tasks = self.pending_tasks.lock().await;
-                        pending_tasks.insert(task.task_id.clone(), pending_task);
-                        sent_tasks += 1;
-                    }
-                    Err(e) => {
-                        println!("   ❌ Failed to send to {}: {}", worker_id, e);
-                        self.mark_worker_failed(worker_id).await;
-                    }
-                }
-            } else {
-                println!("   ⚠️  No data channel for worker: {}", worker_id);
-                self.mark_worker_failed(worker_id).await;
-            }
-        }
-
-        // Collect results with fault tolerance
-        if sent_tasks > 0 {
-            println!("⏳ Waiting for {} results from workers...", sent_tasks);
-
-            let mut collected_results: Vec<f32> = Vec::new();
-            let timeout = tokio::time::Duration::from_secs(60); // Increased timeout for fault tolerance
-            let start_time = tokio::time::Instant::now();
-            let mut last_check_time = std::time::Instant::now();
-
-            let mut results_received = 0usize;
-            let mut received_task_ids = std::collections::HashSet::new();
-            
-            while results_received < sent_tasks && start_time.elapsed() < timeout {
-                // Periodically check for timed-out tasks (every 5 seconds)
-                if last_check_time.elapsed().as_secs() >= 5 {
-                    self.check_and_reassign_timed_out_tasks().await;
-                    last_check_time = std::time::Instant::now();
-                }
-
-                if let Some(mut receiver) = self.result_receiver.take() {
-                    match tokio::time::timeout(
-                        tokio::time::Duration::from_millis(1000),
-                        receiver.recv(),
-                    )
-                    .await
-                    {
-                        Ok(Some(result_msg)) => {
-                            match result_msg {
-                                WorkerResult::Floats { task_id, result, worker_id } => {
-                                    // If the worker returned an empty result, treat this as a failure
-                                    // and attempt to reassign the task instead of counting it as success.
-                                    if result.is_empty() {
-                                        println!(
-                                            "   ⚠️ {} returned 0 values for task {}; treating as failure and attempting reassignment",
-                                            worker_id,
-                                            task_id
-                                        );
-
-                                        // Take the pending task (if it still exists) so we can reassign it.
-                                        let pending_task_opt = {
-                                            let mut pending_tasks = self.pending_tasks.lock().await;
-                                            pending_tasks.remove(&task_id)
-                                        };
-
-                                        if let Some(mut pending_task) = pending_task_opt {
-                                            // Mark this worker as failed so it won't be selected again.
-                                            self.mark_worker_failed(&worker_id).await;
-
-                                            // Try to reassign to another available worker immediately.
-                                            let available_workers = self.get_available_workers().await;
-                                            match self.reassign_task(&pending_task, &available_workers).await {
-                                                Ok(Some(new_worker)) => {
-                                                    // Update tracking for the reassigned task.
-                                                    pending_task.worker_id = new_worker;
-                                                    pending_task.sent_at = std::time::Instant::now();
-                                                    pending_task.retry_count += 1;
-                                                    let mut pending_tasks = self.pending_tasks.lock().await;
-                                                    pending_tasks.insert(task_id.clone(), pending_task);
-                                                }
-                                                Ok(None) | Err(_) => {
-                                                    // If we couldn't reassign, keep the task pending so that
-                                                    // the timeout-based fault tolerance can handle it later.
-                                                    let mut pending_tasks = self.pending_tasks.lock().await;
-                                                    pending_tasks.insert(task_id.clone(), pending_task);
-                                                }
-                                            }
-                                        } else {
-                                            println!(
-                                                "   ⚠️ Received empty result for unknown or already completed task {}",
-                                                task_id
-                                            );
-                                        }
-
-                                        // Do NOT increment results_received or add to collected_results here.
-                                    } else {
-                                        // Successful result path: remove from pending and aggregate values.
-                                        {
-                                            let mut pending_tasks = self.pending_tasks.lock().await;
-                                            pending_tasks.remove(&task_id);
-                                        }
-
-                                        if !received_task_ids.contains(&task_id) {
-                                            println!(
-                                                "   📥 {} returned {} values for task {}",
-                                                worker_id,
-                                                result.len(),
-                                                task_id
-                                            );
-                                            collected_results.extend(result);
-                                            received_task_ids.insert(task_id);
-                                            results_received += 1;
-                                        }
-                                    }
-                                }
-                                WorkerResult::Bytes { task_id: _, result_b64: _, worker_id: _, meta: _ } => {
-                                    println!("   ⚠️ Received bytes result on float path; ignoring");
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            println!("   ⚠️  Result channel closed");
-                            break;
-                        }
-                        Err(_) => {
-                            // Timeout - continue waiting and checking for failures
-                        }
-                    }
-                    self.result_receiver = Some(receiver);
-                }
-            }
-
-            // Check if we have enough results (fault tolerance: continue with partial results)
-            let pending_count = {
-                let pending_tasks = self.pending_tasks.lock().await;
-                pending_tasks.len()
-            };
-
-            if results_received > 0 {
-                println!(
-                    "✅ Received {}/{} results ({} pending, {} failed workers). Collected {} mapped values",
-                    results_received,
-                    sent_tasks,
-                    pending_count,
-                    self.failed_workers.lock().await.len(),
-                    collected_results.len()
-                );
-                
-                // If we have some results, return them (fault tolerance)
-                if !collected_results.is_empty() {
-                    self.disconnect_from_signaling_server().await?;
-                    return Ok(collected_results);
-                }
-            }
-
-            if pending_count > 0 && available_workers.is_empty() {
-                println!(
-                    "❌ No available workers remaining. {} tasks still pending",
-                    pending_count
-                );
-            }
-        }
-
-        // Disconnect and error
-        self.disconnect_from_signaling_server().await?;
-        Err("Failed to get results from distributed workers - remote execution required".into())
-    }
-
-    // Byte-based execution path for arbitrary binary chunks (e.g., video frames)
-    async fn execute_map_with_byte_chunks(
-        &mut self,
-        chunks_b64_with_meta: Vec<(String, Option<serde_json::Value>)>,
+        chunks: Vec<(Vec<u8>, serde_json::Value)>,
         wasm_bytes: &[u8],
         js_glue: &str,
         map_function_name: &str,
-    ) -> Result<Vec<(Option<serde_json::Value>, String)>, Box<dyn std::error::Error + Send + Sync>> {
-        // Connect to signaling server
+        opts: &JobOptions,
+    ) -> Result<Vec<Option<(serde_json::Value, Vec<u8>)>>, DistributeError> {
         self.connect_to_signaling_server().await?;
-        self.is_connected = true;
 
-        // Wait for initial worker discovery
+        // Give discovery and channel setup a moment. Event-driven readiness
+        // replaces these fixed waits in a later phase.
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
-        // Wait for data channels to be established and use actual data channel keys
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        
-        // Use available workers (fault tolerance: excludes failed workers)
-        let mut available_workers = self.get_available_workers().await;
-        if available_workers.is_empty() {
-            return Err("No workers with data channels available for computation".into());
+
+        let available = self.get_available_workers().await;
+        if available.is_empty() {
+            self.disconnect_from_signaling_server().await?;
+            return Err("no workers with open data channels available".into());
         }
 
-        // Prepare tasks by round-robin
-        let wasm_b64 = BASE64.encode(wasm_bytes);
-        let mut tasks: Vec<(String, ComputeTaskBytes)> = Vec::new();
-        // Track first task per worker to include WASM once
-        let mut worker_first_sent: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-        for (i, (chunk_b64, meta)) in chunks_b64_with_meta.into_iter().enumerate() {
-            let worker_idx = i % available_workers.len();
-            let worker_id = available_workers[worker_idx].clone();
-            // Skip sending WASM entirely for JS map functions
-            let is_js_map = map_function_name.ends_with("_js");
-            let include_wasm = !is_js_map && !worker_first_sent.get(&worker_id).copied().unwrap_or(false);
-            let task = ComputeTaskBytes {
-                task_id: format!("task_{}_{}", chrono::Utc::now().timestamp_millis(), i),
-                wasm_module: if include_wasm { wasm_b64.clone() } else { String::new() },
-                js_glue: if include_wasm { js_glue.to_string() } else { String::new() },
-                data_chunk_b64: chunk_b64,
-                map_function: map_function_name.to_string(),
-                meta,
-            };
-            worker_first_sent.insert(worker_id.clone(), true);
-            tasks.push((worker_id, task));
-        }
-
-        // Clear pending tasks tracking
-        {
-            let mut pending_tasks_bytes = self.pending_tasks_bytes.lock().await;
-            pending_tasks_bytes.clear();
-        }
-
-        // Send tasks and track them
-        let mut sent_tasks = 0usize;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let total = chunks.len();
         println!(
-            "📊 Distributing {} byte-chunks to {} available workers",
-            tasks.len(),
-            available_workers.len()
+            "📊 Job {}: {} chunks across {} workers (map fn: {})",
+            job_id,
+            total,
+            available.len(),
+            map_function_name
         );
-        for (worker_id, task) in &tasks {
-            let data_channels = self.data_channels.lock().await;
-            if let Some(channel) = data_channels.get(worker_id) {
-                let task_json = serde_json::to_string(task).unwrap();
-                match Self::send_message_chunked(channel, &task_json, &task.task_id).await {
-                    Ok(_) => {
-                        // Track the task for fault tolerance
-                        let pending_task = PendingTaskBytes {
-                            task_id: task.task_id.clone(),
-                            worker_id: worker_id.clone(),
-                            task: task.clone(),
+
+        // Job-local state.
+        let mut task_store: HashMap<String, (u32, Vec<u8>, serde_json::Value)> = HashMap::new();
+        let mut pending: HashMap<String, PendingTask> = HashMap::new();
+        let mut results: Vec<Option<(serde_json::Value, Vec<u8>)>> = vec![None; total];
+        let mut failed_chunks: BTreeSet<u32> = BTreeSet::new();
+        let mut received_task_ids: HashSet<String> = HashSet::new();
+        let mut workers_with_module: HashSet<String> = HashSet::new();
+        let mut worker_strikes: HashMap<String, u32> = HashMap::new();
+        let mut rr_cursor = 0usize;
+
+        // Initial dispatch, round-robin over available workers.
+        let mut sent = 0usize;
+        for (i, (input, meta)) in chunks.into_iter().enumerate() {
+            let worker_id = available[i % available.len()].clone();
+            let task_id = format!("{}_{}", job_id, i);
+            let header = TaskHeader {
+                job_id: job_id.clone(),
+                task_id: task_id.clone(),
+                chunk_index: i as u32,
+                map_function: map_function_name.to_string(),
+                meta: meta.clone(),
+            };
+            match self
+                .send_task(
+                    &worker_id,
+                    &header,
+                    &input,
+                    wasm_bytes,
+                    js_glue.as_bytes(),
+                    &mut workers_with_module,
+                )
+                .await
+            {
+                Ok(()) => {
+                    pending.insert(
+                        task_id.clone(),
+                        PendingTask {
+                            chunk_index: i as u32,
+                            worker_id,
                             sent_at: std::time::Instant::now(),
                             retry_count: 0,
-                        };
-                        let mut pending_tasks_bytes = self.pending_tasks_bytes.lock().await;
-                        pending_tasks_bytes.insert(task.task_id.clone(), pending_task);
-                        sent_tasks += 1;
-                    }
-                    Err(e) => {
-                        println!("   ❌ Failed to send to {}: {}", worker_id, e);
-                        self.mark_worker_failed(worker_id).await;
-                    }
+                        },
+                    );
+                    sent += 1;
                 }
-            } else {
-                println!("   ⚠️  No data channel for worker: {}", worker_id);
-                self.mark_worker_failed(worker_id).await;
+                Err(e) => {
+                    println!("   ❌ Failed to send chunk {} to {}: {}", i, worker_id, e);
+                    self.mark_worker_failed(&worker_id).await;
+                    // Backdate so the next timeout pass reassigns it immediately.
+                    pending.insert(
+                        task_id.clone(),
+                        PendingTask {
+                            chunk_index: i as u32,
+                            worker_id,
+                            sent_at: std::time::Instant::now()
+                                - std::time::Duration::from_secs(opts.task_timeout_secs + 1),
+                            retry_count: 0,
+                        },
+                    );
+                }
             }
+            task_store.insert(task_id, (i as u32, input, meta));
         }
+        println!("   📤 {} of {} chunks dispatched", sent, total);
 
-        // Collect results with fault tolerance
-        let mut collected: Vec<(Option<serde_json::Value>, String)> = Vec::new();
-        if sent_tasks > 0 {
-            // Dynamic timeout: base 60s + 10s per task (minimum 60s, maximum 600s)
-            let base_timeout = 60usize;
-            let per_task_timeout = 10usize;
-            let calculated_timeout = base_timeout + (sent_tasks * per_task_timeout);
-            let timeout_secs = calculated_timeout.min(600).max(60); // Cap at 10 minutes, minimum 1 minute
-            let timeout = tokio::time::Duration::from_secs(timeout_secs as u64);
-            println!("⏱️  Timeout set to {} seconds for {} tasks", timeout_secs, sent_tasks);
-            
-            let start_time = tokio::time::Instant::now();
-            let mut last_check_time = std::time::Instant::now();
-            let mut results_received = 0usize;
-            let mut received_task_ids = std::collections::HashSet::new();
-            let mut consecutive_timeouts = 0usize;
-            const MAX_CONSECUTIVE_TIMEOUTS: usize = 30; // Stop after 30 seconds of no activity
-            let mut current_timeout = timeout;
-            let mut timeout_extended = false;
-            
-            loop {
-                // Check if we've received all results
-                if results_received >= sent_tasks {
+        // Collect with reassignment.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs((10 * total as u64).clamp(120, 600));
+        let mut last_activity = std::time::Instant::now();
+        let mut last_timeout_check = std::time::Instant::now();
+        let mut completed = 0usize;
+
+        let mut receiver = self
+            .result_receiver
+            .take()
+            .ok_or("result receiver already taken")?;
+
+        while completed + failed_chunks.len() < total {
+            if std::time::Instant::now() > deadline {
+                println!(
+                    "⏱️  Job deadline reached with {} tasks unresolved",
+                    pending.len()
+                );
+                break;
+            }
+            if last_activity.elapsed().as_secs() > 90 {
+                println!("⏱️  No results for 90s; stopping collection");
+                break;
+            }
+
+            if last_timeout_check.elapsed().as_secs() >= 5 {
+                self.reassign_timed_out(
+                    &mut pending,
+                    &task_store,
+                    &mut failed_chunks,
+                    &mut worker_strikes,
+                    &mut workers_with_module,
+                    &mut rr_cursor,
+                    wasm_bytes,
+                    js_glue,
+                    map_function_name,
+                    &job_id,
+                    opts,
+                )
+                .await;
+                last_timeout_check = std::time::Instant::now();
+            }
+
+            let msg = match tokio::time::timeout(
+                tokio::time::Duration::from_millis(1000),
+                receiver.recv(),
+            )
+            .await
+            {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    println!("   ⚠️  Result channel closed");
                     break;
                 }
-                
-                // Check if we've exceeded the timeout
-                let elapsed = start_time.elapsed();
-                if elapsed >= current_timeout {
-                    // Check if there are still pending tasks and available workers
-                    let pending_count = {
-                        let pending_tasks_bytes = self.pending_tasks_bytes.lock().await;
-                        pending_tasks_bytes.len()
-                    };
-                    let available_workers_count = self.get_available_workers().await.len();
-                    
-                    if pending_count > 0 && available_workers_count > 0 && !timeout_extended {
-                        // Still have pending tasks and workers - extend timeout and continue
-                        println!("⏳ Timeout reached but {} tasks still pending with {} available workers. Extending timeout by 60s...", pending_count, available_workers_count);
-                        current_timeout = current_timeout + tokio::time::Duration::from_secs(60);
-                        timeout_extended = true;
-                        // Continue waiting with extended timeout (don't break)
-                    } else {
-                        // Extended timeout also reached or no pending tasks/workers
-                        if pending_count > 0 {
-                            println!("⚠️  Timeout reached. {} tasks still pending. Stopping with partial results.", pending_count);
-                        } else {
-                            println!("⏱️  Timeout reached. No pending tasks.");
-                        }
-                        break;
-                    }
-                }
-                
-                // Periodically check for timed-out tasks (every 5 seconds)
-                if last_check_time.elapsed().as_secs() >= 5 {
-                    self.check_and_reassign_timed_out_tasks().await;
-                    last_check_time = std::time::Instant::now();
-                }
-
-                if let Some(mut receiver) = self.result_receiver.take() {
-                    match tokio::time::timeout(
-                        tokio::time::Duration::from_millis(1000),
-                        receiver.recv(),
-                    )
-                    .await
-                    {
-                        Ok(Some(result_msg)) => {
-                            consecutive_timeouts = 0; // Reset timeout counter on successful receive
-                            match result_msg {
-                                WorkerResult::Bytes { task_id, result_b64, worker_id: _, meta } => {
-                                    // Remove from pending tasks
-                                    {
-                                        let mut pending_tasks_bytes = self.pending_tasks_bytes.lock().await;
-                                        pending_tasks_bytes.remove(&task_id);
-                                    }
-                                    
-                                    if !received_task_ids.contains(&task_id) {
-                                        collected.push((meta, result_b64));
-                                        received_task_ids.insert(task_id);
-                                        results_received += 1;
-                                        if results_received % 10 == 0 {
-                                            println!("   📊 Progress: {}/{} results received", results_received, sent_tasks);
-                                        }
-                                    }
-                                }
-                                WorkerResult::Floats { .. } => {}
-                            }
-                        }
-                        Ok(None) => { 
-                            println!("   ⚠️  Result channel closed");
-                            break; 
-                        }
-                        Err(_) => {
-                            // Timeout on receive - increment counter
-                            consecutive_timeouts += 1;
-                            if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
-                                println!("   ⚠️  No results received for {} seconds. Stopping wait loop.", MAX_CONSECUTIVE_TIMEOUTS);
-                                break;
-                            }
-                        }
-                    }
-                    self.result_receiver = Some(receiver);
-                } else {
-                    // No receiver available - wait a bit and retry
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                }
-            }
-
-            // Check if we have enough results (fault tolerance: continue with partial results)
-            let pending_count = {
-                let pending_tasks_bytes = self.pending_tasks_bytes.lock().await;
-                pending_tasks_bytes.len()
+                Err(_) => continue,
             };
 
-            if results_received > 0 || !collected.is_empty() {
-                println!(
-                    "✅ Received {}/{} byte results ({} pending, {} failed workers)",
-                    results_received,
-                    sent_tasks,
-                    pending_count,
-                    self.failed_workers.lock().await.len()
-                );
-                self.disconnect_from_signaling_server().await?;
-                return Ok(collected);
+            if received_task_ids.contains(&msg.task_id) {
+                continue; // late duplicate after a reassignment
             }
+
+            if let Some(err) = msg.error {
+                println!(
+                    "   ❌ Worker {} failed task {} (chunk {}): {}",
+                    msg.worker_id, msg.task_id, msg.chunk_index, err
+                );
+                if err.contains("no cached module") {
+                    // Coordination artifact, not a worker fault: the worker lost
+                    // (or never got) the module. Re-send with the module included.
+                    workers_with_module.remove(&msg.worker_id);
+                } else {
+                    let strikes = worker_strikes.entry(msg.worker_id.clone()).or_insert(0);
+                    *strikes += 1;
+                    if *strikes >= WORKER_STRIKE_LIMIT {
+                        self.mark_worker_failed(&msg.worker_id).await;
+                    }
+                }
+                if let Some(p) = pending.get_mut(&msg.task_id) {
+                    // Force the next timeout pass to reassign it immediately.
+                    p.sent_at = std::time::Instant::now()
+                        - std::time::Duration::from_secs(opts.task_timeout_secs + 1);
+                }
+                last_activity = std::time::Instant::now();
+                continue;
+            }
+
+            let idx = msg.chunk_index as usize;
+            if idx >= results.len() {
+                println!("   ⚠️  Result with out-of-range chunk index {}", idx);
+                continue;
+            }
+            pending.remove(&msg.task_id);
+            received_task_ids.insert(msg.task_id);
+            if results[idx].is_none() {
+                results[idx] = Some((msg.meta, msg.bytes));
+                completed += 1;
+                if completed % 10 == 0 || completed == total {
+                    println!("   📥 {}/{} results", completed, total);
+                }
+            }
+            last_activity = std::time::Instant::now();
+        }
+
+        self.result_receiver = Some(receiver);
+
+        // Anything still pending counts as missing.
+        for (_, p) in pending.drain() {
+            failed_chunks.insert(p.chunk_index);
         }
 
         self.disconnect_from_signaling_server().await?;
-        Err("Failed to get results from distributed workers - remote execution required".into())
+
+        if !failed_chunks.is_empty() {
+            let missing: Vec<u32> = failed_chunks.iter().copied().collect();
+            match opts.missing_chunks {
+                MissingChunkPolicy::Fail => {
+                    return Err(format!(
+                        "job incomplete: {}/{} chunks missing (indices {:?})",
+                        missing.len(),
+                        total,
+                        &missing[..missing.len().min(20)]
+                    )
+                    .into());
+                }
+                MissingChunkPolicy::AllowPartial => {
+                    println!(
+                        "⚠️  Continuing with partial results: {}/{} chunks missing (indices {:?})",
+                        missing.len(),
+                        total,
+                        &missing[..missing.len().min(20)]
+                    );
+                }
+            }
+        }
+        println!("✅ Job complete: {}/{} chunks", completed, total);
+        Ok(results)
     }
 
-    async fn reduce_results_with_wasm(
+    /// Reassign tasks that exceeded the per-task timeout, regardless of
+    /// whether their worker's channel is still open (a stuck worker looks
+    /// exactly like a slow one from the outside). First result wins; late
+    /// duplicates are deduplicated by task id.
+    #[allow(clippy::too_many_arguments)]
+    async fn reassign_timed_out(
         &self,
-        results: &[f32],
-    ) -> Result<f32, Box<dyn std::error::Error + Send + Sync>> {
-        println!(
-            "🔧 Using local WASM reduce function to combine {} values",
-            results.len()
-        );
-
-        if results.is_empty() {
-            return Ok(0.0);
+        pending: &mut HashMap<String, PendingTask>,
+        task_store: &HashMap<String, (u32, Vec<u8>, serde_json::Value)>,
+        failed_chunks: &mut BTreeSet<u32>,
+        worker_strikes: &mut HashMap<String, u32>,
+        workers_with_module: &mut HashSet<String>,
+        rr_cursor: &mut usize,
+        wasm_bytes: &[u8],
+        js_glue: &str,
+        map_function_name: &str,
+        job_id: &str,
+        opts: &JobOptions,
+    ) {
+        let now = std::time::Instant::now();
+        let timed_out: Vec<String> = pending
+            .iter()
+            .filter(|(_, p)| now.duration_since(p.sent_at).as_secs() > opts.task_timeout_secs)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if timed_out.is_empty() {
+            return;
         }
 
-        // For now, use simple sum reduction
-        // TODO: Load and execute the actual WASM reduce function
-        let total = results.iter().sum();
-        println!("📊 Reduce operation completed: {}", total);
+        let available = self.get_available_workers().await;
+        for task_id in timed_out {
+            let Some(p) = pending.get(&task_id).cloned() else {
+                continue;
+            };
 
-        Ok(total)
+            // Strike the worker that sat on it.
+            let strikes = worker_strikes.entry(p.worker_id.clone()).or_insert(0);
+            *strikes += 1;
+            if *strikes >= WORKER_STRIKE_LIMIT {
+                self.mark_worker_failed(&p.worker_id).await;
+            }
+
+            if p.retry_count >= opts.max_retries {
+                println!(
+                    "   ☠️  Chunk {} exhausted {} retries; marking missing",
+                    p.chunk_index, opts.max_retries
+                );
+                pending.remove(&task_id);
+                failed_chunks.insert(p.chunk_index);
+                continue;
+            }
+
+            // Prefer a different worker; fall back to any available one.
+            let candidates: Vec<&String> =
+                available.iter().filter(|w| **w != p.worker_id).collect();
+            let target = if !candidates.is_empty() {
+                *rr_cursor += 1;
+                Some(candidates[*rr_cursor % candidates.len()].clone())
+            } else {
+                available.first().cloned()
+            };
+            let Some(target) = target else {
+                continue; // no workers right now; retry on a later pass
+            };
+
+            let Some((chunk_index, input, meta)) = task_store.get(&task_id) else {
+                continue;
+            };
+            let header = TaskHeader {
+                job_id: job_id.to_string(),
+                task_id: task_id.clone(),
+                chunk_index: *chunk_index,
+                map_function: map_function_name.to_string(),
+                meta: meta.clone(),
+            };
+            match self
+                .send_task(
+                    &target,
+                    &header,
+                    input,
+                    wasm_bytes,
+                    js_glue.as_bytes(),
+                    workers_with_module,
+                )
+                .await
+            {
+                Ok(()) => {
+                    println!(
+                        "   🔄 Reassigned chunk {} from {} to {} (retry {})",
+                        chunk_index,
+                        p.worker_id,
+                        target,
+                        p.retry_count + 1
+                    );
+                    if let Some(entry) = pending.get_mut(&task_id) {
+                        entry.worker_id = target;
+                        entry.sent_at = std::time::Instant::now();
+                        entry.retry_count += 1;
+                    }
+                }
+                Err(e) => {
+                    println!("   ❌ Reassignment to {} failed: {}", target, e);
+                    self.mark_worker_failed(&target).await;
+                }
+            }
+        }
     }
 
-    async fn connect_to_signaling_server(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn connect_to_signaling_server(&mut self) -> Result<(), DistributeError> {
         let url = url::Url::parse(&self.ws_url)?;
         let (ws_stream, _) = connect_async(url).await?;
         let (ws_sender, mut ws_receiver) = ws_stream.split();
 
         let ws_sender = Arc::new(Mutex::new(ws_sender));
-
-        // Store ws_sender for cleanup
         self.ws_sender = Some(ws_sender.clone());
 
-        // Register as master node
         {
             let mut sender = ws_sender.lock().await;
-            let register_msg = serde_json::json!({
-                "type": "registerMaster"
-            });
-            sender.send(Message::Text(register_msg.to_string())).await?;
+            let register_msg = serde_json::json!({ "type": "registerMaster" });
+            sender
+                .send(Message::Text(register_msg.to_string()))
+                .await?;
         }
 
-        // Handle WebSocket messages
         let workers_arc = self.workers.clone();
         let my_id_arc = Arc::new(Mutex::new(self.my_id.clone()));
         let peer_connections_arc = self.peer_connections.clone();
@@ -1430,7 +599,6 @@ impl DistributedCompute {
                                         let my_id = my_id_arc.lock().await;
                                         let current_id =
                                             my_id.as_ref().map(|s| s.as_str()).unwrap_or("");
-
                                         let mut workers = workers_arc.lock().await;
                                         *workers = peers
                                             .iter()
@@ -1441,7 +609,6 @@ impl DistributedCompute {
                                     }
                                 }
                                 "offer" => {
-                                    // Handle offer from worker - create answer
                                     if let (Some(from), Some(to), Some(offer)) = (
                                         parsed.get("from").and_then(|v| v.as_str()),
                                         parsed.get("to").and_then(|v| v.as_str()),
@@ -1466,28 +633,27 @@ impl DistributedCompute {
                                     }
                                 }
                                 "answer" => {
-                                    // Handle answer from worker
                                     if let (Some(from), Some(answer)) = (
                                         parsed.get("from").and_then(|v| v.as_str()),
                                         parsed.get("answer"),
                                     ) {
-                                        println!("📨 Received answer from worker: {}", from);
                                         let peer_connections = peer_connections_arc.lock().await;
                                         if let Some(pc) = peer_connections.get(from) {
                                             if let Some(sdp) =
                                                 answer.get("sdp").and_then(|v| v.as_str())
                                             {
-                                                let answer_desc =
+                                                if let Ok(answer_desc) =
                                                     RTCSessionDescription::answer(sdp.to_string())
-                                                        .unwrap();
-                                                let _ =
-                                                    pc.set_remote_description(answer_desc).await;
+                                                {
+                                                    let _ = pc
+                                                        .set_remote_description(answer_desc)
+                                                        .await;
+                                                }
                                             }
                                         }
                                     }
                                 }
                                 "candidate" => {
-                                    // Handle ICE candidate from worker
                                     if let (Some(from), Some(candidate)) = (
                                         parsed.get("from").and_then(|v| v.as_str()),
                                         parsed.get("candidate"),
@@ -1520,6 +686,7 @@ impl DistributedCompute {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_offer_from_worker(
         worker_id: String,
         offer: serde_json::Value,
@@ -1538,14 +705,12 @@ impl DistributedCompute {
             Mutex<HashMap<String, Arc<webrtc::peer_connection::RTCPeerConnection>>>,
         >,
         data_channels_arc: Arc<Mutex<HashMap<String, Arc<RTCDataChannel>>>>,
-        result_sender: mpsc::Sender<WorkerResult>,
+        result_sender: mpsc::Sender<WorkerResultMsg>,
         failed_workers_arc: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     ) {
-        let worker_id_clone = worker_id.clone();
-        let worker_id_clone2 = worker_id.clone();
-        let worker_id_clone3 = worker_id.clone();
+        let worker_id_for_channel = worker_id.clone();
+        let worker_id_for_answer = worker_id.clone();
 
-        // Create WebRTC peer connection for this worker
         let config = RTCConfiguration {
             ice_servers: vec![RTCIceServer {
                 urls: vec!["stun:stun.l.google.com:19302".to_owned()],
@@ -1558,39 +723,35 @@ impl DistributedCompute {
         if let Ok(peer_connection) = api.new_peer_connection(config).await {
             let pc = Arc::new(peer_connection);
 
-            // Fault tolerance: Monitor connection state changes
             let worker_id_for_state = worker_id.clone();
-            let failed_workers_arc_clone = failed_workers_arc.clone();
+            let failed_workers_clone = failed_workers_arc.clone();
             pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
                 let worker_id = worker_id_for_state.clone();
-                let failed_workers = failed_workers_arc_clone.clone();
-                println!("🔍 Connection state changed for worker {}: {:?}", worker_id, s);
-                
-                // Mark worker as failed if connection is closed/failed/disconnected
-                if matches!(s, 
-                    RTCPeerConnectionState::Closed |
-                    RTCPeerConnectionState::Failed |
-                    RTCPeerConnectionState::Disconnected
+                let failed_workers = failed_workers_clone.clone();
+                println!("🔍 Connection state for worker {}: {:?}", worker_id, s);
+                if matches!(
+                    s,
+                    RTCPeerConnectionState::Closed
+                        | RTCPeerConnectionState::Failed
+                        | RTCPeerConnectionState::Disconnected
                 ) {
                     let rt = tokio::runtime::Handle::current();
                     rt.spawn(async move {
-                        let mut failed_workers = failed_workers.lock().await;
-                        failed_workers.insert(worker_id.clone(), std::time::Instant::now());
-                        println!("⚠️  Worker {} connection lost, marked as failed", worker_id);
+                        let mut failed = failed_workers.lock().await;
+                        failed.insert(worker_id.clone(), std::time::Instant::now());
+                        println!("⚠️  Worker {} connection lost, marked failed", worker_id);
                     });
                 }
                 Box::pin(async {})
             }));
 
-            // Set up ICE candidate handling
             let ws_sender_clone = ws_sender.clone();
             let my_id_clone = my_id.clone();
-
+            let worker_id_for_ice = worker_id.clone();
             pc.on_ice_candidate(Box::new(move |candidate| {
                 let ws_sender = ws_sender_clone.clone();
-                let worker_id = worker_id_clone.clone();
+                let worker_id = worker_id_for_ice.clone();
                 let my_id = my_id_clone.clone();
-
                 Box::pin(async move {
                     if let Some(cand) = candidate {
                         let candidate_msg = serde_json::json!({
@@ -1603,81 +764,89 @@ impl DistributedCompute {
                                 "sdpMLineIndex": 0
                             }
                         });
-
                         let mut sender = ws_sender.lock().await;
                         let _ = sender.send(Message::Text(candidate_msg.to_string())).await;
                     }
                 })
             }));
 
-            // Set up data channel handling
             pc.on_data_channel(Box::new(move |data_channel| {
                 let result_sender = result_sender.clone();
-                let worker_id = worker_id_clone2.clone();
+                let worker_id = worker_id_for_channel.clone();
                 let data_channels_arc = data_channels_arc.clone();
 
                 Box::pin(async move {
-                    println!("📡 Master: on_data_channel fired for worker: {}", worker_id);
-                    println!("   Channel state: {:?}", data_channel.ready_state());
-                    
-                    // Store the data channel
-                    let mut channels = data_channels_arc.lock().await;
-                    channels.insert(worker_id.clone(), data_channel.clone());
-                    println!("🔗 Stored data channel for worker: {} (total channels: {})", worker_id, channels.len());
+                    println!("📡 Data channel from worker {}", worker_id);
+                    {
+                        let mut channels = data_channels_arc.lock().await;
+                        channels.insert(worker_id.clone(), data_channel.clone());
+                    }
 
-                    // Fault tolerance: Monitor data channel state changes
-                    // Note: We monitor the connection state instead since on_close may not be available
-                    // The connection state change handler above will catch channel closures
-
-                    // Set up message handling
+                    // One reassembler per channel; results arrive as binary frames.
+                    let reassembler = Arc::new(Mutex::new(Reassembler::new()));
+                    let worker_id_for_msg = worker_id.clone();
                     data_channel.on_message(Box::new(move |msg| {
                         let result_sender = result_sender.clone();
-
+                        let reassembler = reassembler.clone();
+                        let worker_id = worker_id_for_msg.clone();
                         Box::pin(async move {
-                            if let Ok(text) = String::from_utf8(msg.data.to_vec()) {
-                                // Try to parse as either float or bytes result
-                                match serde_json::from_str::<WorkerResult>(&text) {
-                                    Ok(result) => {
-                                        let _ = result_sender.send(result).await;
+                            if msg.is_string {
+                                return; // text frames are not part of the protocol
+                            }
+                            let frame = match decode_frame(&msg.data) {
+                                Ok(f) => f,
+                                Err(e) => {
+                                    println!("❌ Bad frame from {}: {}", worker_id, e);
+                                    return;
+                                }
+                            };
+                            let completed = {
+                                let mut r = reassembler.lock().await;
+                                r.accept(frame)
+                            };
+                            if let Some((ftype, _id, payload)) = completed {
+                                if ftype != FRAME_RESULT {
+                                    return;
+                                }
+                                match decode_result_payload(&payload) {
+                                    Ok((header, body)) => {
+                                        let _ = result_sender
+                                            .send(WorkerResultMsg {
+                                                task_id: header.task_id,
+                                                chunk_index: header.chunk_index,
+                                                worker_id: header.worker_id,
+                                                error: header.error,
+                                                meta: header.meta,
+                                                bytes: body,
+                                            })
+                                            .await;
                                     }
                                     Err(e) => {
-                                        println!("❌ Failed to parse WorkerResult from worker message: {}", e);
-                                        println!("   Raw message: {}", text);
+                                        println!("❌ Bad result payload from {}: {}", worker_id, e);
                                     }
                                 }
-                            } else {
-                                println!("❌ Failed to convert message data to UTF-8 string");
                             }
                         })
                     }));
                 })
             }));
 
-            // Set remote description from offer
             if let Some(sdp) = offer.get("sdp").and_then(|v| v.as_str()) {
-                let offer_desc = RTCSessionDescription::offer(sdp.to_string()).unwrap();
-
-                if let Ok(_) = pc.set_remote_description(offer_desc).await {
-                    // Create answer
-                    if let Ok(answer) = pc.create_answer(None).await {
-                        if let Ok(_) = pc.set_local_description(answer.clone()).await {
-                            // Send answer back
-                            let answer_msg = serde_json::json!({
-                                "type": "answer",
-                                "to": worker_id_clone3,
-                                "from": my_id,
-                                "answer": {
+                if let Ok(offer_desc) = RTCSessionDescription::offer(sdp.to_string()) {
+                    if pc.set_remote_description(offer_desc).await.is_ok() {
+                        if let Ok(answer) = pc.create_answer(None).await {
+                            if pc.set_local_description(answer.clone()).await.is_ok() {
+                                let answer_msg = serde_json::json!({
                                     "type": "answer",
-                                    "sdp": answer.sdp
-                                }
-                            });
-
-                            let mut sender = ws_sender.lock().await;
-                            let _ = sender.send(Message::Text(answer_msg.to_string())).await;
-
-                            // Store peer connection
-                            let mut connections = peer_connections_arc.lock().await;
-                            connections.insert(worker_id_clone3, pc);
+                                    "to": worker_id_for_answer,
+                                    "from": my_id,
+                                    "answer": { "type": "answer", "sdp": answer.sdp }
+                                });
+                                let mut sender = ws_sender.lock().await;
+                                let _ = sender.send(Message::Text(answer_msg.to_string())).await;
+                                let mut connections = peer_connections_arc.lock().await;
+                                connections.insert(worker_id_for_answer, pc);
+                            }
                         }
                     }
                 }
@@ -1685,29 +854,219 @@ impl DistributedCompute {
         }
     }
 
-    async fn disconnect_from_signaling_server(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn disconnect_from_signaling_server(&mut self) -> Result<(), DistributeError> {
         if let Some(ws_sender) = &self.ws_sender {
             let mut sender = ws_sender.lock().await;
             let _ = sender.close().await;
             println!("🔌 Disconnected from signaling server");
         }
         self.ws_sender = None;
-        self.is_connected = false;
         Ok(())
     }
 }
 
-/// Simplified interface for distributed map-reduce operations
-/// Automatically compiles WASM functions and handles distribution
+async fn compile_examples_to_wasm() -> Result<(Vec<u8>, String), DistributeError> {
+    use std::path::PathBuf;
+    println!("🔧 Compiling examples to WASM for distributed execution...");
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(override_dir) = std::env::var("W3DGE_WASM_EXAMPLES_DIR") {
+        candidates.push(PathBuf::from(override_dir));
+    }
+    let current_dir = std::env::current_dir()?;
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    candidates.push(current_dir.clone());
+    candidates.push(current_dir.join("examples"));
+    if let Some(parent) = current_dir.parent() {
+        candidates.push(parent.join("examples"));
+    }
+    if let Some(root) = manifest_dir.parent() {
+        candidates.push(root.join("examples"));
+    }
+
+    let examples_dir = candidates
+        .iter()
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("examples") && p.exists())
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "Unable to locate examples directory. Tried: {}",
+                candidates
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+
+    println!("📁 Using examples directory: {}", examples_dir.display());
+
+    let output = Command::new("wasm-pack")
+        .args(["build", "--target", "web", "--out-dir", "pkg"])
+        .current_dir(&examples_dir)
+        .output()?;
+    if !output.status.success() {
+        let error_msg = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("WASM compilation failed: {}", error_msg).into());
+    }
+
+    let wasm_bytes = fs::read(examples_dir.join("pkg").join("distributed_examples_bg.wasm"))?;
+    let js_glue = fs::read_to_string(examples_dir.join("pkg").join("distributed_examples.js"))?;
+    println!(
+        "📦 WASM module {} bytes, JS glue {} bytes",
+        wasm_bytes.len(),
+        js_glue.len()
+    );
+    Ok((wasm_bytes, js_glue))
+}
+
+/// General byte-based distributed map-reduce with default options.
+pub async fn run_distributed_mapreduce_bytes<
+    Input,
+    ItemOutput,
+    FinalOutput,
+    ChunkFn,
+    ReduceFn,
+    ChunkEncodeFn,
+    ResultDecodeFn,
+>(
+    input: Input,
+    map_function_name: &str,
+    chunker: ChunkFn,
+    reducer: ReduceFn,
+    chunk_encoder: ChunkEncodeFn,
+    result_decoder: ResultDecodeFn,
+) -> Result<FinalOutput, DistributeError>
+where
+    Input: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+    ItemOutput: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+    FinalOutput: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+    ChunkFn: Fn(&Input) -> Vec<Input> + Send + Sync,
+    ReduceFn: Fn(Vec<ItemOutput>) -> FinalOutput + Send + Sync,
+    ChunkEncodeFn: Fn(&Input) -> (Vec<u8>, serde_json::Value) + Send + Sync,
+    ResultDecodeFn: Fn(Vec<u8>, serde_json::Value) -> ItemOutput + Send + Sync,
+{
+    run_distributed_mapreduce_bytes_opts(
+        input,
+        map_function_name,
+        chunker,
+        reducer,
+        chunk_encoder,
+        result_decoder,
+        JobOptions::default(),
+    )
+    .await
+}
+
+/// General byte-based distributed map-reduce.
+///
+/// Results are decoded and reduced in chunk order. Missing chunks follow
+/// `opts.missing_chunks`: `Fail` (default) errors the job, `AllowPartial`
+/// skips them while preserving the order of the rest.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_distributed_mapreduce_bytes_opts<
+    Input,
+    ItemOutput,
+    FinalOutput,
+    ChunkFn,
+    ReduceFn,
+    ChunkEncodeFn,
+    ResultDecodeFn,
+>(
+    input: Input,
+    map_function_name: &str,
+    chunker: ChunkFn,
+    reducer: ReduceFn,
+    chunk_encoder: ChunkEncodeFn,
+    result_decoder: ResultDecodeFn,
+    opts: JobOptions,
+) -> Result<FinalOutput, DistributeError>
+where
+    Input: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+    ItemOutput: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+    FinalOutput: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+    ChunkFn: Fn(&Input) -> Vec<Input> + Send + Sync,
+    ReduceFn: Fn(Vec<ItemOutput>) -> FinalOutput + Send + Sync,
+    ChunkEncodeFn: Fn(&Input) -> (Vec<u8>, serde_json::Value) + Send + Sync,
+    ResultDecodeFn: Fn(Vec<u8>, serde_json::Value) -> ItemOutput + Send + Sync,
+{
+    println!(
+        "🌐 Running distributed byte map with function: {}",
+        map_function_name
+    );
+
+    let (wasm_bytes, js_glue) = compile_examples_to_wasm().await?;
+
+    let chunks = chunker(&input);
+    let mut encoded: Vec<(Vec<u8>, serde_json::Value)> = Vec::with_capacity(chunks.len());
+    for ch in chunks.iter() {
+        let (bytes, meta) = chunk_encoder(ch);
+        if !bytes.is_empty() {
+            encoded.push((bytes, meta));
+        }
+    }
+    if encoded.is_empty() {
+        return Err("chunker produced no non-empty chunks".into());
+    }
+
+    let mut distributor = DistributedCompute::new().await?;
+    let results = distributor
+        .execute_byte_job(encoded, &wasm_bytes, &js_glue, map_function_name, &opts)
+        .await?;
+
+    let mut outputs: Vec<ItemOutput> = Vec::with_capacity(results.len());
+    for slot in results {
+        if let Some((meta, bytes)) = slot {
+            outputs.push(result_decoder(bytes, meta));
+        }
+    }
+    Ok(reducer(outputs))
+}
+
+fn extract_numbers_from_value(value: &serde_json::Value) -> Option<Vec<f32>> {
+    if let Some(arr) = value.as_array() {
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            out.push(v.as_f64()? as f32);
+        }
+        return Some(out);
+    }
+    if let Some(obj) = value.as_object() {
+        if let Some(numbers) = obj.get("numbers") {
+            return extract_numbers_from_value(numbers);
+        }
+    }
+    None
+}
+
+fn f32s_to_le_bytes(vals: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() * 4);
+    for v in vals {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+fn le_bytes_to_f32s(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Numeric convenience API, kept for the numeric example and the benchmark.
+///
+/// Inputs must serialize to a JSON value containing an f32 array (either a
+/// bare array or a `numbers` field). Each chunk's floats travel as raw
+/// little-endian bytes over the general byte pipeline and results come back
+/// in chunk order.
 pub async fn run_distributed_mapreduce<Input, Output, ChunkFn, ReduceFn>(
     input: Input,
     map_function_name: &str,
     chunker: ChunkFn,
     reducer: ReduceFn,
     execution_mode: ExecutionMode,
-) -> Output
+) -> Result<Output, DistributeError>
 where
     Input: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
     Output: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
@@ -1722,99 +1081,47 @@ where
         }
     );
 
-    // Use the existing implementation with provided functions
-    run_distributed_impl_with_code(
-        move |_data: Input| -> Output {
-            // Dummy function (not used) - create default output
-            panic!("Dummy function should not be called in distributed mode")
-        },
+    let encoder = |chunk: &Input| -> (Vec<u8>, serde_json::Value) {
+        let nums = serde_json::to_value(chunk)
+            .ok()
+            .and_then(|v| extract_numbers_from_value(&v))
+            .unwrap_or_default();
+        (f32s_to_le_bytes(&nums), serde_json::json!({}))
+    };
+    let decoder =
+        |bytes: Vec<u8>, _meta: serde_json::Value| -> Vec<f32> { le_bytes_to_f32s(&bytes) };
+    let float_reducer =
+        |per_chunk: Vec<Vec<f32>>| -> Vec<f32> { per_chunk.into_iter().flatten().collect() };
+
+    let mapped: Vec<f32> = run_distributed_mapreduce_bytes(
         input,
-        chunker,
-        reducer,
-        execution_mode,
-        "", // Empty function body (not used)
         map_function_name,
+        chunker,
+        float_reducer,
+        encoder,
+        decoder,
     )
-    .await
-}
+    .await?;
 
-/// Byte-based distributed map-reduce that supports arbitrary user-defined Input/Output
-/// by providing chunk encoder/decoder closures and a target WASM map function name.
-pub async fn run_distributed_mapreduce_bytes<Input, ItemOutput, FinalOutput, ChunkFn, ReduceFn, ChunkEncodeFn, ResultDecodeFn>(
-    input: Input,
-    map_function_name: &str,
-    chunker: ChunkFn,
-    reducer: ReduceFn,
-    chunk_encoder: ChunkEncodeFn,
-    result_decoder: ResultDecodeFn,
-) -> FinalOutput
-where
-    Input: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
-    ItemOutput: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
-    FinalOutput: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
-    ChunkFn: Fn(&Input) -> Vec<Input> + Send + Sync,
-    ReduceFn: Fn(Vec<ItemOutput>) -> FinalOutput + Send + Sync,
-    ChunkEncodeFn: Fn(&Input) -> (Vec<u8>, serde_json::Value) + Send + Sync,
-    ResultDecodeFn: Fn(Vec<u8>, serde_json::Value) -> ItemOutput + Send + Sync,
-{
-    println!("🌐 Running distributed byte-map with function: {}", map_function_name);
-
-    // Compile WASM from examples directory (or target dir)
-    let (wasm_bytes, js_glue) = match compile_examples_to_wasm(map_function_name).await {
-        Ok(v) => v,
-        Err(e) => {
-            println!("⚠️ WASM compilation failed: {}", e);
-            return reducer(Vec::new());
-        }
-    };
-
-    // Chunk and encode
-    let chunks = chunker(&input);
-    let mut chunks_b64_with_meta: Vec<(String, Option<serde_json::Value>)> = Vec::with_capacity(chunks.len());
-    for ch in chunks.iter() {
-        let (bytes, meta) = chunk_encoder(ch);
-        if !bytes.is_empty() {
-            chunks_b64_with_meta.push((BASE64.encode(bytes), Some(meta)));
-        }
-    }
-    if chunks_b64_with_meta.is_empty() {
-        println!("⚠️ No byte chunks produced by chunker");
-        return reducer(Vec::new());
-    }
-
-    // Execute distributed
-    let mut distributor = match DistributedCompute::new().await {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Failed to create distributed compute: {}", e);
-            return reducer(Vec::new());
-        }
-    };
-
-    let results = match distributor
-        .execute_map_with_byte_chunks(chunks_b64_with_meta, &wasm_bytes, &js_glue, map_function_name)
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Distributed byte-map execution failed: {}", e);
-            return reducer(Vec::new());
-        }
-    };
-
-    // Decode to Output and reduce
-    let mut outputs: Vec<ItemOutput> = Vec::with_capacity(results.len());
-    for (meta_opt, result_b64) in results {
-        match BASE64.decode(result_b64) {
-            Ok(bytes) => {
-                let meta = meta_opt.unwrap_or(serde_json::Value::Null);
-                outputs.push(result_decoder(bytes, meta));
-            }
-            Err(e) => {
-                println!("⚠️ Failed to decode base64 result: {}", e);
+    let mut converted: Vec<Output> = Vec::with_capacity(mapped.len());
+    for v in mapped {
+        let direct: Result<Output, _> = serde_json::from_value(serde_json::Value::from(v));
+        match direct {
+            Ok(o) => converted.push(o),
+            Err(_) => {
+                let wrapped = serde_json::json!({ "value": v });
+                match serde_json::from_value::<Output>(wrapped) {
+                    Ok(o) => converted.push(o),
+                    Err(_) => {
+                        return Err(format!(
+                            "cannot convert mapped value {} into the requested output type",
+                            v
+                        )
+                        .into())
+                    }
+                }
             }
         }
     }
-
-    reducer(outputs)
+    Ok(reducer(converted))
 }
