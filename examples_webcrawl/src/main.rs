@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use distribute_runtime::run_distributed_mapreduce_bytes;
+use distribute_runtime::{run_distributed_mapreduce_bytes_opts, JobOptions, MissingChunkPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::fs;
@@ -98,17 +98,23 @@ async fn main() -> Result<()> {
     // Create crawl job
     let job = CrawlJob { urls };
     
-    // Distribute URL fetching and title extraction using WASM worker function
+    // Distribute URL fetching and title extraction using WASM worker function.
+    // A crawl tolerates gaps, so accept partial results rather than failing.
     println!("🌐 Starting distributed web crawl...");
-    let result: FinalOutput = run_distributed_mapreduce_bytes(
+    let result: FinalOutput = run_distributed_mapreduce_bytes_opts(
         job,
         "fetch_url_title",
         chunker,
         reducer,
         encode_chunk,
         decode_result,
+        JobOptions {
+            missing_chunks: MissingChunkPolicy::AllowPartial,
+            ..JobOptions::default()
+        },
     )
-    .await;
+    .await
+    .map_err(|e| anyhow::anyhow!("distributed crawl failed: {e}"))?;
     
     // Write results to output file
     let output_file = std::env::args()

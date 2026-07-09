@@ -120,16 +120,25 @@ fn encode_chunk(chunk: &VideoJob) -> (Vec<u8>, serde_json::Value) {
     (bytes, meta)
 }
 
-// 4) Decoder: write processed PNG bytes back to temp dir for later re-encode
+// 4) Decoder: workers return raw grayscale RGBA; encode to PNG here for the re-encode step
 #[derive(Clone, Serialize, Deserialize, Debug)]
 struct FrameOut { index: u32, path: PathBuf }
 
 fn decode_result(bytes: Vec<u8>, meta: serde_json::Value) -> FrameOut {
     let idx = meta["frame_index"].as_u64().unwrap_or(0) as u32;
+    let w = meta["width"].as_u64().unwrap_or(0) as u32;
+    let h = meta["height"].as_u64().unwrap_or(0) as u32;
     let out_dir = std::env::temp_dir().join("w3dge_bw_frames");
     std::fs::create_dir_all(&out_dir).ok();
     let out_path = out_dir.join(format!("bw_{:06}.png", idx));
-    std::fs::write(&out_path, &bytes).ok();
+    match image::RgbaImage::from_raw(w, h, bytes) {
+        Some(img) => {
+            if let Err(e) = img.save(&out_path) {
+                eprintln!("Failed to write frame {}: {}", idx, e);
+            }
+        }
+        None => eprintln!("Frame {} has unexpected byte length for {}x{}", idx, w, h),
+    }
     FrameOut { index: idx, path: out_path }
 }
 
@@ -171,12 +180,15 @@ async fn main() -> Result<()> {
     let input_video = std::env::args().nth(1).unwrap_or("input.mp4".to_string());
     let fps: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(30);
 
-    // Temp workspace
+    // Temp workspace; also clear stale processed frames from previous runs
     let temp_dir = std::env::temp_dir().join("w3dge_frames");
     if temp_dir.exists() {
         fs::remove_dir_all(&temp_dir).await.ok();
     }
     fs::create_dir_all(&temp_dir).await.ok();
+    fs::remove_dir_all(std::env::temp_dir().join("w3dge_bw_frames"))
+        .await
+        .ok();
 
     // Extract frames
     let (width, height, frames) = extract_frames(&input_video, &temp_dir, fps).await?;
@@ -194,12 +206,14 @@ async fn main() -> Result<()> {
     // Distribute grayscale conversion using WASM worker function
     let result: VideoResult = run_distributed_mapreduce_bytes(
         job,
-        "grayscale_frame_js",
+        "grayscale_frame_rgba",
         chunker,
         reducer,
         encode_chunk,
         decode_result,
-    ).await;
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("distributed grayscale job failed: {e}"))?;
 
     println!("Black & White video written to: {}", result.output_path);
     Ok(())
