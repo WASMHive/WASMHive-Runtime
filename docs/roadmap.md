@@ -2,7 +2,7 @@
 
 Ordered by priority. Items marked (bug) affect correctness.
 
-Phase 1 (July 2026) landed the binary framed protocol, the unified byte pipeline, ordered results with an explicit missing-chunk policy, and the fault-tolerance fixes below. Phase 2 (July 2026) landed content-hash module artifacts, the pull scheduler, and event-driven job start.
+Phase 1 (July 2026) landed the binary framed protocol, the unified byte pipeline, ordered results with an explicit missing-chunk policy, and the fault-tolerance fixes below. Phase 2 (July 2026) landed content-hash module artifacts, the pull scheduler, and event-driven job start. Phase 4 (July 2026) landed the `examples_raytrace` showcase, proving the new-workload-is-one-crate model (measured 4.9s to 2.3s going from one worker to two, byte-identical output). Hosting a public hive (the former phase 3) is deferred: the project is local-first open source for now.
 
 ## P0: one runtime that generalizes to any task
 

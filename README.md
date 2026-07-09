@@ -33,11 +33,23 @@ The runtime handles WASM compilation (via `wasm-pack`), worker discovery, WebRTC
 
 | Crate | What it is |
 |---|---|
-| `distribute_runtime` | The runtime library: signaling client, WebRTC master, task scheduling, fault tolerance |
+| `distribute_runtime` | The runtime library: signaling client, WebRTC master, binary protocol, pull scheduler, fault tolerance |
 | `examples` | The WASM module shipped to workers (`cpu_map`, `gpu_map` via WebGPU, `grayscale_frame_rgba`, `fetch_url_title`) plus a numeric map-reduce demo |
+| `examples_raytrace` | Distributed path tracer: tiles rendered across the hive, assembled into a PNG. Fully self-contained crate carrying its own WASM module |
 | `examples_bw` | Distributed video grayscale: ffmpeg frame extraction, per-frame map on workers, re-encode |
 | `examples_webcrawl` | Distributed URL title extraction over a URL list |
 | `benchmark` | Throughput/latency benchmark suite (`run_benchmark.sh`) |
+
+## 🎨 Showcase: distributed path tracing
+
+![Path traced spheres rendered across browser workers](docs/images/raytrace-640x360-24spp.png)
+
+```bash
+cargo run -p examples_raytrace              # 640x360, 24 samples/pixel
+cargo run -p examples_raytrace -- 1280 720 64 render.png
+```
+
+Every 80x80 tile is one task; browser tabs pull tiles from the queue and tabs opened mid-render join in automatically. Rendering is deterministic (per-pixel seeded RNG), so a retried or duplicated tile is byte-identical and the same image hashes out no matter how many workers ran it. Measured on one laptop with headless Chrome workers: 4.9s with one worker tab, 2.3s with two, identical output hashes.
 
 ## 🚀 Quick start
 
@@ -47,6 +59,9 @@ Prerequisites: Rust, [`wasm-pack`](https://rustwasm.github.io/wasm-pack/), Node.
 2. Run an example from this repo:
 
 ```bash
+# Distributed path tracer (writes raytrace_out.png)
+cargo run -p examples_raytrace
+
 # Numeric map-reduce (CPU/GPU)
 cargo run -p distributed_examples
 
@@ -69,9 +84,41 @@ cargo run -p benchmark -- --workers 1,2,4 --task-sizes 100,1000 --mode both --it
 
 See `benchmark/README.md` for options. For the Docker comparison baseline, see [docker-hive](https://github.com/WASMHive/docker-hive).
 
+## 🧩 Write your own workload
+
+A workload is one crate; the framework does not change. The recipe:
+
+1. A `lib.rs` with `crate-type = ["cdylib", "rlib"]` exporting map functions with the worker contract, sync or async:
+
+```rust
+#[wasm_bindgen]
+pub fn my_map(input: Vec<u8>, meta: JsValue) -> Vec<u8> {
+    // bytes in, bytes out; meta carries small JSON you attach per chunk
+}
+```
+
+2. A `main.rs` that supplies four closures and points the job at your crate:
+
+```rust
+let result = run_distributed_mapreduce_bytes_opts(
+    input,
+    "my_map",
+    chunker,        // Input -> Vec<Input>
+    reducer,        // Vec<ItemOutput> -> FinalOutput (chunk order preserved)
+    encode_chunk,   // Input -> (Vec<u8>, serde_json::Value)
+    decode_result,  // (Vec<u8>, serde_json::Value) -> ItemOutput
+    JobOptions {
+        module: ModuleSource::CompileCrate(env!("CARGO_MANIFEST_DIR").into()),
+        ..JobOptions::default()
+    },
+).await?;
+```
+
+Workers cache your module by content hash, tasks stream over a pull queue with per-worker pipelining, failed or slow tasks are retried on other workers, and missing chunks follow your `MissingChunkPolicy` (`Fail` by default, `AllowPartial` for gap-tolerant jobs). `examples_raytrace` is a complete ~450-line reference.
+
 ## 🗺️ Roadmap
 
-Active work is tracked in [docs/roadmap.md](docs/roadmap.md). Headline items: unifying the numeric and byte task paths, a fully generic worker dispatcher, content-hash WASM caching, pull-based scheduling, and binary wire frames.
+Active work is tracked in [docs/roadmap.md](docs/roadmap.md). Landed: binary wire protocol, unified byte pipeline, ordered results with explicit missing-chunk policy, content-hash module store, pull scheduling with mid-job worker absorption. Next up: Web Worker execution in the tab, configurable STUN/TURN, and a hosted hive.
 
 ## 📄 License
 

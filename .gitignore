@@ -18,3 +18,4 @@ seeds.txt
 # OS / editor noise
 .DS_Store
 node_modules/
+raytrace_*.png
