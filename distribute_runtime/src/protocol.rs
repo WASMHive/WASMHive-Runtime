@@ -19,6 +19,10 @@ pub const FRAME_MAGIC: u8 = 0xA5;
 pub const PROTO_VERSION: u8 = 1;
 pub const FRAME_TASK: u8 = 1;
 pub const FRAME_RESULT: u8 = 2;
+/// Master -> worker: a WASM module + JS glue, addressed by content hash.
+pub const FRAME_MODULE: u8 = 3;
+/// Worker -> master: small JSON control messages (e.g. need_module).
+pub const FRAME_CONTROL: u8 = 4;
 /// Keep frames comfortably under common SCTP message-size limits.
 pub const MAX_FRAME_PAYLOAD: usize = 60_000;
 
@@ -28,6 +32,10 @@ pub struct TaskHeader {
     pub task_id: String,
     pub chunk_index: u32,
     pub map_function: String,
+    /// Content hash of the module this task needs. Workers cache modules by
+    /// this hash across jobs and request missing ones with need_module.
+    #[serde(default)]
+    pub module_hash: String,
     #[serde(default)]
     pub meta: serde_json::Value,
 }
@@ -217,6 +225,29 @@ pub fn decode_task_payload(buf: &[u8]) -> Result<TaskPayload, String> {
     })
 }
 
+/// Module payload: `[u32 hash_len][hash ascii][u32 wasm_len][wasm][u32 glue_len][glue]`
+pub fn encode_module_payload(hash: &str, wasm: &[u8], glue: &[u8]) -> Vec<u8> {
+    let hash_bytes = hash.as_bytes();
+    let mut out = Vec::with_capacity(12 + hash_bytes.len() + wasm.len() + glue.len());
+    out.extend_from_slice(&(hash_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(hash_bytes);
+    out.extend_from_slice(&(wasm.len() as u32).to_le_bytes());
+    out.extend_from_slice(wasm);
+    out.extend_from_slice(&(glue.len() as u32).to_le_bytes());
+    out.extend_from_slice(glue);
+    out
+}
+
+pub fn decode_module_payload(buf: &[u8]) -> Result<(String, Vec<u8>, Vec<u8>), String> {
+    let mut pos = 0usize;
+    let hash_bytes = read_section(buf, &mut pos)?;
+    let hash =
+        String::from_utf8(hash_bytes).map_err(|_| "module hash is not utf8".to_string())?;
+    let wasm = read_section(buf, &mut pos)?;
+    let glue = read_section(buf, &mut pos)?;
+    Ok((hash, wasm, glue))
+}
+
 /// Result payload: `[u32 header_len][header json][body bytes]`
 pub fn encode_result_payload(header: &ResultHeader, body: &[u8]) -> Vec<u8> {
     let header_json = serde_json::to_vec(header).expect("result header serializes");
@@ -340,12 +371,29 @@ mod tests {
     }
 
     #[test]
+    fn module_payload_roundtrip() {
+        let enc = encode_module_payload("abc123", &[1, 2, 3], b"glue");
+        let (hash, wasm, glue) = decode_module_payload(&enc).unwrap();
+        assert_eq!(hash, "abc123");
+        assert_eq!(wasm, vec![1, 2, 3]);
+        assert_eq!(glue, b"glue");
+    }
+
+    #[test]
+    fn task_header_missing_hash_defaults_empty() {
+        let json = br#"{"job_id":"j","task_id":"t","chunk_index":0,"map_function":"f"}"#;
+        let h: TaskHeader = serde_json::from_slice(json).unwrap();
+        assert_eq!(h.module_hash, "");
+    }
+
+    #[test]
     fn task_payload_roundtrip() {
         let header = TaskHeader {
             job_id: "job1".into(),
             task_id: "t1".into(),
             chunk_index: 3,
             map_function: "grayscale_frame_rgba".into(),
+            module_hash: "deadbeef".into(),
             meta: serde_json::json!({"width": 2, "height": 2}),
         };
         let enc = encode_task_payload(&header, &[9, 9], &[], &[1, 2, 3]);
